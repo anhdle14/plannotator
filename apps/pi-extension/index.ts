@@ -740,6 +740,16 @@ export default function plannotator(pi: ExtensionAPI): void {
 		},
 	});
 
+	// Shift+Tab cycles plan mode (normal <-> planning), Claude Code style.
+	// Pi's default shift+tab (app.thinking.cycle) is remapped to alt+t in
+	// ~/.pi/agent/keybindings.json so this shortcut can own the key.
+	pi.registerShortcut(Key.shift("tab"), {
+		description: "Cycle plan mode (normal <-> planning)",
+		handler: async (ctx) => {
+			await togglePlanMode(ctx);
+		},
+	});
+
 	// ── plannotator_submit_plan Tool ────────────────────────────────────
 
 	pi.registerTool({
