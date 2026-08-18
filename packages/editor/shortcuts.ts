@@ -1,14 +1,17 @@
 import {
   annotationPanelShortcuts,
   annotationToolbarShortcuts,
+  annotateSidebarShortcuts,
   commentPopoverShortcuts,
   createShortcutRegistry,
   createShortcutScopeHook,
   defineShortcutScope,
+  documentViewShortcuts,
   goalSetupShortcuts,
   imageAnnotatorShortcuts,
   inputMethodShortcuts,
   viewerShortcuts,
+  vimSelectionShortcuts,
   type ShortcutSurface,
 } from '@plannotator/ui/shortcuts';
 
@@ -77,9 +80,11 @@ const annotateEditorSettingsShortcuts = defineShortcutScope({
 });
 
 const sharedPlanSurfaceShortcuts = [
+  documentViewShortcuts,
   inputMethodShortcuts,
   annotationToolbarShortcuts,
   viewerShortcuts,
+  vimSelectionShortcuts,
   commentPopoverShortcuts,
   annotationPanelShortcuts,
   imageAnnotatorShortcuts,
@@ -92,6 +97,7 @@ export const planReviewSettingsShortcutRegistry = createShortcutRegistry([
 
 export const annotateSettingsShortcutRegistry = createShortcutRegistry([
   annotateEditorSettingsShortcuts,
+  annotateSidebarShortcuts,
   ...sharedPlanSurfaceShortcuts,
 ] as const);
 

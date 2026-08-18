@@ -3,6 +3,7 @@ import React, { useEffect, useRef, useState } from 'react';
 interface ActionMenuProps {
   className?: string;
   panelClassName?: string;
+  panelWidth?: 'default' | 'wide';
   renderTrigger: (props: {
     isOpen: boolean;
     toggleMenu: () => void;
@@ -13,6 +14,7 @@ interface ActionMenuProps {
 export const ActionMenu: React.FC<ActionMenuProps> = ({
   className,
   panelClassName,
+  panelWidth = 'default',
   renderTrigger,
   children,
 }) => {
@@ -50,7 +52,9 @@ export const ActionMenu: React.FC<ActionMenuProps> = ({
       })}
 
       {isOpen && (
-        <div className={panelClassName ?? 'absolute top-full right-0 mt-1 w-56 rounded-lg border border-border bg-popover py-1 shadow-xl z-[70]'}>
+        <div
+          className={panelClassName ?? `absolute top-full right-0 mt-1 ${panelWidth === 'wide' ? 'w-64' : 'w-56'} rounded-lg border border-border bg-popover py-1 shadow-xl z-[70]`}
+        >
           {children({ closeMenu: () => setIsOpen(false) })}
         </div>
       )}
@@ -64,6 +68,7 @@ interface ActionMenuItemProps {
   label: string;
   subtitle?: string;
   badge?: React.ReactNode;
+  disabled?: boolean;
 }
 
 export const ActionMenuItem: React.FC<ActionMenuItemProps> = ({
@@ -72,10 +77,14 @@ export const ActionMenuItem: React.FC<ActionMenuItemProps> = ({
   label,
   subtitle,
   badge,
+  disabled = false,
 }) => (
   <button
+    data-pn-touch-target
+    type="button"
     onClick={onClick}
-    className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition-colors hover:bg-muted"
+    disabled={disabled}
+    className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:bg-transparent"
   >
     <span className="text-muted-foreground">{icon}</span>
     {subtitle ? (

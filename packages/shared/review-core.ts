@@ -5,11 +5,28 @@
  * self-contained while review diff logic remains sourced from one module.
  */
 
-import { resolve as resolvePath } from "node:path";
+import {
+  formatDiffMetadataPathToken,
+  formatPatchPathToken,
+  unquoteGitPath,
+  parsePatchPathToken,
+  parseDiffFilePathLines,
+  parseDiffGitHeader,
+  parseDiffMetadataPathLines,
+  OVERSIZED_REVIEW_STUB_MARKER,
+} from "./diff-paths";
 
 export const JJ_TRUNK_REVSET = "trunk()";
+/** Maximum regular-file payload accepted for Git diff expansion. */
+export const MAX_REVIEW_FILE_CONTENT_BYTES = 5 * 1024 * 1024;
+
+const MAX_UNTRACKED_DIFF_CONCURRENCY = 4;
+// Fingerprints run every few seconds, so use a deliberately lower read ceiling
+// than one-shot diff generation. Larger files use size + mtime metadata.
+const MAX_UNTRACKED_FINGERPRINT_CONTENT_BYTES = 1024 * 1024;
 
 export type DiffType =
+  | "since-base"
   | "uncommitted"
   | "staged"
   | "unstaged"
@@ -22,7 +39,9 @@ export type DiffType =
   | "branch"
   | "merge-base"
   | "all"
+  | `commit:${string}`
   | `worktree:${string}`
+  | `gitbutler:${string}`
   | "p4-default"
   | `p4-changelist:${string}`;
 
@@ -93,7 +112,9 @@ export interface GitContext {
   compareTarget?: CompareTargetConfig;
   repository?: RepositoryContext;
   cwd?: string;
-  vcsType?: "git" | "jj" | "p4";
+  vcsType?: "git" | "gitbutler" | "jj" | "p4";
+  /** Hash of the exact GitButler branch/commit topology used for this context. */
+  gitButlerRevision?: string;
   /** Evolution log entries for the current jj change (jj only). */
   jjEvologs?: JjEvoLogEntry[];
   /** HEAD ancestry, newest first. Powers the commit-based baseline picker (#709). */
@@ -104,20 +125,183 @@ export interface DiffResult {
   patch: string;
   label: string;
   error?: string;
+  /**
+   * Provider context captured from the same source revision as `patch`.
+   * Providers whose topology can change independently of Git refs use this
+   * to let the server publish one atomic review snapshot.
+   */
+  gitContext?: GitContext;
+  /** Freshness baseline captured from the same source revision as `patch`. */
+  fingerprint?: string;
 }
 
 export interface GitCommandResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+  /**
+   * Set when `maxOutputBytes` was reached and the runtime stopped reading. The
+   * command was killed, so `exitCode` reports the signal, not the command's own
+   * verdict, and `stdout` is a prefix — never a usable result.
+   */
+  truncated?: boolean;
+}
+
+/** Per-command execution policy understood by every review Git runtime. */
+export interface GitCommandOptions {
+  cwd?: string;
+  timeoutMs?: number;
+  /** UTF-8 data written to stdin, then closed before waiting for output. */
+  stdin?: string;
+  /** Whether the command may ask the user for credentials. Defaults to `"allow"`. */
+  interaction?: "allow" | "forbid";
+  /**
+   * Hard ceiling on buffered stdout. The runtime stops reading and kills the
+   * command once the limit is passed, so a command that can emit an unbounded
+   * tree (a whole-repository diff) bounds real memory growth instead of being
+   * rejected after it has already been held in full. The result is flagged
+   * `truncated`. Omitted means no ceiling.
+   */
+  maxOutputBytes?: number;
+  /**
+   * Extra Git configuration for this one command, injected through the
+   * `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n`
+   * environment variables at the process boundary (`prepareGitCommand`).
+   * Deliberately NOT passed as `-c` argv flags: callers and tests match on
+   * the exact argv a command was invoked with, so config must never change
+   * the argument vector.
+   */
+  config?: Record<string, string>;
+}
+
+/** Runtime-neutral Git arguments and subprocess policy produced at the process boundary. */
+export interface PreparedGitCommand {
+  /** Arguments passed after the `git` executable. */
+  args: string[];
+  /** Per-process environment. Omitted when the inherited environment is unchanged. */
+  env?: Record<string, string | undefined>;
+  /** Whether the runtime must put the command in its own killable process group. */
+  isolateProcessGroup: boolean;
+}
+
+/** Filesystem metadata resolved by the host runtime, never by browser-safe core code. */
+export interface ReviewFileInfo {
+  path: string;
+  size: number;
+  mtimeMs: number;
+  isFile: boolean;
+  isSymbolicLink: boolean;
+  isExecutable: boolean;
 }
 
 export interface ReviewGitRuntime {
   runGit: (
     args: string[],
-    options?: { cwd?: string; timeoutMs?: number },
+    options?: GitCommandOptions,
   ) => Promise<GitCommandResult>;
   readTextFile: (path: string) => Promise<string | null>;
+  /** Resolve and stat one file relative to a repository root or other base path. */
+  getFileInfo: (
+    basePath: string | undefined,
+    path: string,
+  ) => Promise<ReviewFileInfo | null>;
+  /** Read a symlink payload without following its target. */
+  readLink: (path: string) => Promise<string | null>;
+}
+
+function quoteGitSshPath(path: string): string {
+  return `"${path.replace(/["\\$`]/g, "\\$&")}"`;
+}
+
+function inheritedSshCommand(environment: Readonly<Record<string, string | undefined>>): string {
+  const command = environment.GIT_SSH_COMMAND?.trim();
+  if (command) return command;
+  const executable = environment.GIT_SSH?.trim();
+  return executable ? quoteGitSshPath(executable) : "ssh";
+}
+
+function usesPlink(
+  environment: Readonly<Record<string, string | undefined>>,
+  sshCommand: string,
+): boolean {
+  const variant = environment.GIT_SSH_VARIANT?.trim().toLowerCase();
+  if (variant === "plink" || variant === "tortoiseplink") return true;
+  if (variant === "ssh" || variant === "simple") return false;
+  return /(?:^|[\\/])(?:tortoise)?plink(?:\.exe)?(?:[\s"']|$)/i.test(sshCommand);
+}
+
+/**
+ * Translate `GitCommandOptions.config` into `GIT_CONFIG_*` environment
+ * variables. Entries append after any config already injected through the
+ * inherited environment (git reads keys `0..COUNT-1`), so a caller-provided
+ * `GIT_CONFIG_COUNT` keeps working. Returns null when there is nothing to add.
+ */
+function gitConfigEnvironment(
+  config: Record<string, string> | undefined,
+  environment: Readonly<Record<string, string | undefined>>,
+): Record<string, string> | null {
+  const entries = Object.entries(config ?? {});
+  if (entries.length === 0) return null;
+  const inheritedCount = Number(environment.GIT_CONFIG_COUNT ?? "0");
+  const offset =
+    Number.isSafeInteger(inheritedCount) && inheritedCount > 0 ? inheritedCount : 0;
+  const env: Record<string, string> = {
+    GIT_CONFIG_COUNT: String(offset + entries.length),
+  };
+  entries.forEach(([key, value], index) => {
+    env[`GIT_CONFIG_KEY_${offset + index}`] = key;
+    env[`GIT_CONFIG_VALUE_${offset + index}`] = value;
+  });
+  return env;
+}
+
+/**
+ * Prepare one Git subprocess without mutating the parent environment.
+ *
+ * Commands that forbid interaction disable Git credential prompts, request SSH
+ * batch mode (including PuTTY/plink), and request process-group isolation so
+ * the runtime can terminate transport children on timeout. Interactive Git
+ * commands retain the caller's exact authentication behavior. Per-command
+ * config rides `GIT_CONFIG_*` environment variables, never argv.
+ */
+export function prepareGitCommand(
+  args: string[],
+  options: GitCommandOptions | undefined,
+  environment: Readonly<Record<string, string | undefined>>,
+): PreparedGitCommand {
+  const configEnv = gitConfigEnvironment(options?.config, environment);
+  const interaction = options?.interaction ?? "allow";
+  if (interaction === "allow") {
+    return {
+      args: ["-c", "core.quotePath=false", ...args],
+      ...(configEnv ? { env: { ...environment, ...configEnv } } : {}),
+      isolateProcessGroup: false,
+    };
+  }
+
+  const sshCommand = inheritedSshCommand(environment);
+  const connectTimeoutSeconds = Math.max(1, Math.ceil((options?.timeoutMs ?? 5_000) / 1_000));
+  const sshBatchOptions = usesPlink(environment, sshCommand)
+    ? "-batch"
+    : `-o BatchMode=yes -o ConnectTimeout=${connectTimeoutSeconds}`;
+
+  return {
+    args: [
+      "-c",
+      "core.quotePath=false",
+      "-c",
+      "credential.interactive=false",
+      ...args,
+    ],
+    env: {
+      ...environment,
+      ...configEnv,
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_SSH_COMMAND: `${sshCommand} ${sshBatchOptions}`,
+      SSH_ASKPASS_REQUIRE: "never",
+    },
+    isolateProcessGroup: true,
+  };
 }
 
 export interface GitDiffOptions {
@@ -192,32 +376,60 @@ export async function getDefaultBranch(
     }
   }
 
+  // origin/HEAD is often unset (feature-only clones, CI checkouts, extra
+  // worktrees, `clone --branch X`). Those setups routinely have NO local
+  // main/master either — but the remote-tracking ref is fetched and diffable.
+  // Check it before the local names (matching the prefer-upstream intent
+  // above) and before the blind "master" guess, or since-base gets suppressed
+  // for the whole session on a repo that could serve it fine.
+  const originMain = await runtime.runGit(
+    ["show-ref", "--verify", "--quiet", "refs/remotes/origin/main"],
+    { cwd },
+  );
+  if (originMain.exitCode === 0) return "origin/main";
+
   const mainBranch = await runtime.runGit(
     ["show-ref", "--verify", "refs/heads/main"],
     { cwd },
   );
   if (mainBranch.exitCode === 0) return "main";
 
+  const originMaster = await runtime.runGit(
+    ["show-ref", "--verify", "--quiet", "refs/remotes/origin/master"],
+    { cwd },
+  );
+  if (originMaster.exitCode === 0) return "origin/master";
+
   return "master";
+}
+
+export interface RemoteDefaultInfo {
+  /** Tracking ref name, e.g. `origin/main`. */
+  branch: string;
+  /** The remote's current tip SHA for that branch (from the same ls-remote
+   * response), or null if it couldn't be parsed. */
+  remoteHeadSha: string | null;
 }
 
 /**
  * Query the remote for its default branch via `ls-remote --symref`. Returns
- * `origin/<name>` if the remote answers and the tracking ref exists locally,
- * otherwise `null`. Designed to run in the background at server startup — the
- * caller fires it with `.then()` and uses the result if/when it arrives.
+ * `origin/<name>` plus the remote tip SHA if the remote answers and the
+ * tracking ref exists locally, otherwise `null`. Designed to run in the
+ * background at server startup — the caller fires it with `.then()` and uses
+ * the result if/when it arrives.
  *
- * Timeout-guarded: if the network is slow or absent, the promise resolves
- * (with `null`) once the timeout fires. Never throws.
+ * Noninteractive and timeout-guarded: credential/SSH prompts are forbidden,
+ * and a slow or absent network resolves with `null` once the timeout fires.
+ * Never throws.
  */
-export async function detectRemoteDefaultBranch(
+export async function detectRemoteDefaultInfo(
   runtime: ReviewGitRuntime,
   cwd?: string,
-): Promise<string | null> {
+): Promise<RemoteDefaultInfo | null> {
   try {
     const lsRemote = await runtime.runGit(
       ["ls-remote", "--symref", "origin", "HEAD"],
-      { cwd, timeoutMs: 5000 },
+      { cwd, timeoutMs: 5000, interaction: "forbid" },
     );
     if (lsRemote.exitCode !== 0) return null;
     const match = lsRemote.stdout.match(/^ref:\s+refs\/heads\/(\S+)\s+HEAD/m);
@@ -227,16 +439,45 @@ export async function detectRemoteDefaultBranch(
       ["show-ref", "--verify", "--quiet", `refs/remotes/${remoteBranch}`],
       { cwd },
     );
-    return refExists.exitCode === 0 ? remoteBranch : null;
+    if (refExists.exitCode !== 0) return null;
+    // The same response carries the remote tip: `<sha>\tHEAD`.
+    const shaMatch = lsRemote.stdout.match(/^([0-9a-f]{40,64})\s+HEAD$/m);
+    return { branch: remoteBranch, remoteHeadSha: shaMatch ? shaMatch[1] : null };
   } catch {
     return null;
   }
 }
 
+/** Back-compat wrapper: just the tracking ref name. */
+export async function detectRemoteDefaultBranch(
+  runtime: ReviewGitRuntime,
+  cwd?: string,
+): Promise<string | null> {
+  return (await detectRemoteDefaultInfo(runtime, cwd))?.branch ?? null;
+}
+
 const RECENT_COMMIT_LIMIT_DEFAULT = 20;
 // US (\x1F) separator avoids collisions with commit subjects, author names, and
 // dates while staying compatible with `git log --pretty=format`.
-const COMMIT_FIELD_SEP = "\x1f";
+export const COMMIT_FIELD_SEP = "\x1f";
+
+/**
+ * Split a COMMIT_FIELD_SEP-formatted git output into exactly
+ * `head + 1 + tail` fields. A literal US byte inside the one free-text field
+ * (subject or body) over-splits the raw string; the fixed-shape head and tail
+ * fields let us rejoin the middle losslessly. Returns null when the input has
+ * fewer fields than the format guarantees. Shared by every %x1f parser
+ * (here and commit-history.ts) so the over-split edge case lives in one place.
+ */
+export function splitCommitFormatFields(value: string, head: number, tail: number): string[] | null {
+  const parts = value.split(COMMIT_FIELD_SEP);
+  if (parts.length < head + tail + 1) return null;
+  return [
+    ...parts.slice(0, head),
+    parts.slice(head, parts.length - tail).join(COMMIT_FIELD_SEP),
+    ...parts.slice(parts.length - tail),
+  ];
+}
 
 /**
  * Walk HEAD's ancestry and return the most-recent commits for the
@@ -257,16 +498,9 @@ export async function listRecentCommits(
   const commits: RecentCommit[] = [];
   for (const line of result.stdout.split("\n")) {
     if (!line) continue;
-    const parts = line.split(COMMIT_FIELD_SEP);
-    if (parts.length < 5) continue;
-    // If a subject contains a literal US byte the split over-divides. sha/
-    // shortSha are fixed-shape at the start and relativeDate/author at the
-    // end, so rejoin everything between back into the subject.
-    const sha = parts[0];
-    const shortSha = parts[1];
-    const author = parts[parts.length - 1];
-    const relativeDate = parts[parts.length - 2];
-    const subject = parts.slice(2, parts.length - 2).join(COMMIT_FIELD_SEP);
+    const fields = splitCommitFormatFields(line, 2, 2);
+    if (!fields) continue;
+    const [sha, shortSha, subject, relativeDate, author] = fields;
     commits.push({ sha, shortSha, subject, relativeDate, author });
   }
   return commits;
@@ -385,12 +619,40 @@ export async function getGitContext(
     listRecentCommits(runtime, cwd),
   ]);
 
-  const diffOptions: DiffOption[] = [
+  const diffOptions: DiffOption[] = [];
+
+  // "Since <base>" — the composite default: merge-base(base, HEAD) vs the
+  // working tree plus untracked. Everything a PR would show if pushed now.
+  // Emitted first so it wins resolveInitialDiffType's diffOptions[0] fallback.
+  //
+  // Only offer it when the base ref actually resolves. getDefaultBranch returns
+  // a literal "master" as a last resort even when no such ref exists (a repo
+  // whose trunk is e.g. `trunk`, or a clone with no origin/HEAD). If we offered
+  // since-base there it would become the auto-default, then merge-base fails and
+  // the diff degrades to HEAD — silently hiding all committed branch work. When
+  // it's absent, resolveInitialDiffType falls through to `uncommitted`.
+  if (defaultBranch) {
+    const baseResolves = (
+      await runtime.runGit(
+        ["rev-parse", "--verify", "--quiet", "--end-of-options", `${defaultBranch}^{commit}`],
+        { cwd },
+      )
+    ).exitCode === 0;
+    if (baseResolves) {
+      // Dynamic label so it matches the live gitRef header ("All changes
+      // since origin/main" / "... since master") rather than a hardcoded
+      // base name that contradicts it on non-main repos. The product/
+      // first-run copy uses the short form "All changes".
+      diffOptions.push({ id: "since-base", label: `All changes since ${displayRef(defaultBranch)}` });
+    }
+  }
+
+  diffOptions.push(
     { id: "uncommitted", label: "Uncommitted changes" },
     { id: "staged", label: "Staged changes" },
     { id: "unstaged", label: "Unstaged changes" },
     { id: "last-commit", label: "Last commit" },
-  ];
+  );
 
   // Always offer Branch diff / PR Diff when a default branch exists. The
   // older guard hid them when the reviewer was on the default branch (the
@@ -402,7 +664,7 @@ export async function getGitContext(
   // old guard hid the active mode's option, trapping them. Unconditional
   // emission keeps the active option reachable in every flow.
   if (defaultBranch) {
-    diffOptions.push({ id: "merge-base", label: "Committed changes" });
+    diffOptions.push({ id: "merge-base", label: "Committed changes (PR view)" });
   }
 
   diffOptions.push({ id: "all", label: "All files (HEAD)" });
@@ -424,7 +686,7 @@ export async function getGitContext(
     worktrees: worktrees.filter((wt) => wt.path !== currentTreePath),
     availableBranches,
     compareTarget: {
-      diffTypes: ["branch", "merge-base"],
+      diffTypes: ["since-base", "branch", "merge-base"],
       fallback: "main",
       picker: {
         rowLabel: "compare against",
@@ -442,43 +704,534 @@ export async function getGitContext(
   };
 }
 
+/**
+ * Remove tracked DELETION blocks whose path also exists as an untracked file.
+ * `git rm --cached f` (optionally then editing f) reports f as BOTH a tracked
+ * deletion and an untracked file — the file is still on disk, so the working-tree
+ * (untracked) side carries the real content. Keep THAT and drop the misleading
+ * deletion: exactly one diff entry per path (no path-keyed dock/nav collision)
+ * AND the reviewer sees the actual content, not a phantom delete.
+ *
+ * The deletion's path is read from its `--- a/<path>` line via the shared
+ * parsePatchPathToken (handles C-quoting and git's unquoted-space trailing-tab).
+ * Binary deletions carry no `--- ` line, so a binary `rm --cached` isn't deduped
+ * — an accepted edge (binary + untracked + unstaged-delete is vanishingly rare).
+ *
+ * Known accepted edge (since-base): a deletion COMMITTED on the branch whose
+ * path was then recreated untracked is also deduped — the review shows the
+ * recreated file as a plain untracked addition and hides that a base version
+ * was removed. Distinguishing it (file absent at HEAD) would mean emitting two
+ * same-path entries, which the path-keyed UI (dock panel, nav, sections map,
+ * viewed state) cannot represent; showing the current content wins.
+ */
+function removeTrackedDeletions(patch: string, untrackedPaths: Set<string>): string {
+  if (!patch || untrackedPaths.size === 0) return patch;
+  const lines = patch.split("\n");
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (!lines[i].startsWith("diff --git ")) {
+      out.push(lines[i]);
+      i++;
+      continue;
+    }
+    const start = i;
+    i++;
+    while (i < lines.length && !lines[i].startsWith("diff --git ")) i++;
+    const block = lines.slice(start, i);
+    const isDeletion = block.some(
+      (l) => l.startsWith("deleted file mode") || l === "+++ /dev/null",
+    );
+    let delPath: string | null = null;
+    if (isDeletion) {
+      const minus = block.find((l) => l.startsWith("--- "));
+      if (minus) {
+        const p = parsePatchPathToken(minus.slice(4), "a");
+        if (p && p !== "/dev/null") delPath = p;
+      }
+    }
+    if (!(isDeletion && delPath && untrackedPaths.has(delPath))) out.push(...block);
+  }
+  return out.join("\n");
+}
+
+/**
+ * Resolve the repo toplevel for path resolution. Patch/porcelain paths are
+ * repo-ROOT-relative; a review launched from a repo SUBDIRECTORY has its cwd
+ * inside the repo, and resolving root-relative paths against that cwd
+ * double-prefixes them (or aims git pathspecs at the wrong subtree). Every
+ * place that turns a patch path into a filesystem path or git pathspec must
+ * go through this. Falls back to the given cwd when rev-parse fails.
+ */
+async function resolveRepoToplevel(
+  runtime: ReviewGitRuntime,
+  cwd?: string,
+): Promise<string | undefined> {
+  const top = await runtime.runGit(["rev-parse", "--show-toplevel"], { cwd });
+  const trimmed = top.exitCode === 0 ? top.stdout.trim() : "";
+  return trimmed || cwd;
+}
+
+interface RawDiffEntry {
+  oldMode: string;
+  newMode: string;
+  oldObjectId: string;
+  newObjectId: string;
+  status: string;
+  oldPath: string | null;
+  newPath: string | null;
+}
+
+interface OversizedTrackedDiffEntry extends RawDiffEntry {
+  oldObjectId: string;
+  newObjectId: string;
+}
+
+const NULL_OBJECT_ID = /^0+$/;
+
+function parseRawDiffEntries(output: string): RawDiffEntry[] {
+  const fields = output.split("\0");
+  const entries: RawDiffEntry[] = [];
+  let index = 0;
+
+  while (index < fields.length) {
+    const header = fields[index++];
+    if (!header) continue;
+    if (!header.startsWith(":")) {
+      throw new Error("git diff --raw returned an invalid record");
+    }
+
+    const metadata = header.slice(1).split(" ");
+    if (metadata.length !== 5 || !metadata[4]) {
+      throw new Error("git diff --raw returned malformed metadata");
+    }
+    const [oldMode, newMode, oldObjectId, newObjectId, status] = metadata;
+    const renamedOrCopied = status[0] === "R" || status[0] === "C";
+    const oldPath = fields[index++] ?? null;
+    const newPath = renamedOrCopied ? fields[index++] ?? null : oldPath;
+    if (!oldPath || !newPath) {
+      throw new Error("git diff --raw returned a record without a path");
+    }
+
+    entries.push({
+      oldMode,
+      newMode,
+      oldObjectId,
+      newObjectId,
+      status,
+      oldPath: status[0] === "A" ? null : oldPath,
+      newPath: status[0] === "D" ? null : newPath,
+    });
+  }
+
+  return entries;
+}
+
+function isNullObjectId(objectId: string): boolean {
+  return NULL_OBJECT_ID.test(objectId);
+}
+
+function isGitlink(entry: RawDiffEntry): boolean {
+  return entry.oldMode === "160000" || entry.newMode === "160000";
+}
+
+/**
+ * Batch-probe object sizes for the oversized-path preflight.
+ *
+ * Returns `null` when the batch command itself fails (locked or corrupt
+ * object database, resource exhaustion, a hung git killed by the timeout).
+ * Callers must then treat blob sizes as unknown-but-bounded and rely on the
+ * git-native `core.bigFileThreshold` bound applied to every rendered diff
+ * (`BOUNDED_DIFF_GIT_CONFIG`) — the old behavior of marking EVERY object
+ * oversized replaced the whole review with binary stubs on one failed probe.
+ * Working-tree sizes come from filesystem stat and never from this probe.
+ *
+ * A probe that ran answers per object with a size or with `null`, which means
+ * "unknown", never "oversized": an object the batch reports as `missing`,
+ * omits from its output, or answers with an unparseable/negative size has no
+ * usable size. `missing` is routine for tree-vs-worktree diffs — every path
+ * pulled into rename/copy detection gets its WORKING-TREE content hashed by
+ * git and that hash printed in `--raw` output without ever being written to
+ * the object database — and it also happens in partial clones. Mapping those
+ * to infinity excluded files git can plainly diff, so a renamed-and-edited
+ * file rendered as an empty binary stub (#1167). Callers bound an unknown new
+ * side by filesystem stat, and every ODB blob stays bounded by
+ * `core.bigFileThreshold` (`BOUNDED_DIFF_GIT_CONFIG`).
+ */
+async function getGitObjectSizes(
+  runtime: ReviewGitRuntime,
+  objectIds: string[],
+  cwd?: string,
+): Promise<Map<string, number | null> | null> {
+  const uniqueObjectIds = [...new Set(objectIds.filter((objectId) => !isNullObjectId(objectId)))];
+  const sizes = new Map<string, number | null>();
+  if (uniqueObjectIds.length === 0) return sizes;
+
+  const result = await runtime.runGit(
+    ["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+    {
+      cwd,
+      stdin: `${uniqueObjectIds.join("\n")}\n`,
+      timeoutMs: 5000,
+      interaction: "forbid",
+    },
+  );
+  if (result.exitCode !== 0) return null;
+
+  for (const line of result.stdout.split("\n")) {
+    const [objectId, objectType, objectSize] = line.split(" ");
+    if (!objectId || objectType === "missing") continue;
+    const size = Number(objectSize);
+    sizes.set(objectId, Number.isFinite(size) && size >= 0 ? size : null);
+  }
+  for (const objectId of uniqueObjectIds) {
+    if (!sizes.has(objectId)) sizes.set(objectId, null);
+  }
+  return sizes;
+}
+
+async function getWorkingTreeFileInfo(
+  runtime: ReviewGitRuntime,
+  root: string | undefined,
+  path: string | null,
+): Promise<ReviewFileInfo | null> {
+  if (!path) return null;
+  try {
+    const fileInfo = await runtime.getFileInfo(root, path);
+    return fileInfo?.isFile || fileInfo?.isSymbolicLink ? fileInfo : null;
+  } catch {
+    return null;
+  }
+}
+
+async function hashOversizedWorkingTreeFile(
+  runtime: ReviewGitRuntime,
+  path: string,
+  file: ReviewFileInfo,
+  cwd?: string,
+): Promise<string> {
+  const result = await runtime.runGit(
+    ["hash-object", "--no-filters", "--", file.path],
+    { cwd },
+  );
+  if (result.exitCode === 0 && /^[0-9a-f]{40,64}$/i.test(result.stdout.trim())) {
+    return result.stdout.trim();
+  }
+  // The patch remains safely omitted even if a concurrently deleted file
+  // cannot be hashed. Retain deterministic stat metadata for freshness.
+  return hashFingerprintPart(`${path}:${file.size}:${file.mtimeMs}`);
+}
+
+function buildOversizedTrackedStub(entry: OversizedTrackedDiffEntry): string {
+  const headerOldToken = formatPatchPathToken("a", entry.oldPath ?? entry.newPath!);
+  const headerNewToken = formatPatchPathToken("b", entry.newPath ?? entry.oldPath!);
+  const oldToken = entry.oldPath ? formatPatchPathToken("a", entry.oldPath) : "/dev/null";
+  const newToken = entry.newPath ? formatPatchPathToken("b", entry.newPath) : "/dev/null";
+  const oldId = isNullObjectId(entry.oldObjectId) ? "000000000000" : entry.oldObjectId.slice(0, 12);
+  const newId = isNullObjectId(entry.newObjectId) ? "000000000000" : entry.newObjectId.slice(0, 12);
+  // The marker tells the UI this is OUR size-cap stub rather than a real
+  // binary file, so the card can say why it has no contents.
+  const lines = [
+    `diff --git ${headerOldToken} ${headerNewToken}`,
+    OVERSIZED_REVIEW_STUB_MARKER,
+  ];
+
+  if (!entry.oldPath) lines.push(`new file mode ${entry.newMode}`);
+  if (!entry.newPath) lines.push(`deleted file mode ${entry.oldMode}`);
+  if (entry.status[0] === "R") {
+    const similarity = Number(entry.status.slice(1));
+    if (Number.isFinite(similarity)) lines.push(`similarity index ${similarity}%`);
+    lines.push(`rename from ${formatDiffMetadataPathToken(entry.oldPath!)}`);
+    lines.push(`rename to ${formatDiffMetadataPathToken(entry.newPath!)}`);
+  } else if (entry.status[0] === "C") {
+    const similarity = Number(entry.status.slice(1));
+    if (Number.isFinite(similarity)) lines.push(`similarity index ${similarity}%`);
+    lines.push(`copy from ${formatDiffMetadataPathToken(entry.oldPath!)}`);
+    lines.push(`copy to ${formatDiffMetadataPathToken(entry.newPath!)}`);
+  }
+  if (entry.oldPath && entry.newPath && entry.oldMode !== entry.newMode) {
+    lines.push(`old mode ${entry.oldMode}`);
+    lines.push(`new mode ${entry.newMode}`);
+  }
+  lines.push(
+    `index ${oldId}..${newId}${entry.oldMode === entry.newMode ? ` ${entry.newMode}` : ""}`,
+  );
+  if (entry.oldObjectId !== entry.newObjectId) {
+    lines.push(`Binary files ${oldToken} and ${newToken} differ`);
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+
+interface BoundedTrackedDiff {
+  patch: string;
+  fingerprintMetadata: string[];
+}
+
+/**
+ * Git-native memory bound for rendered review diffs. `core.bigFileThreshold`
+ * makes git itself treat blobs above the review content cap as binary and
+ * emit tiny `Binary files ... differ` stubs instead of formatting their
+ * bytes, so patch output stays bounded even when the JS-side size probe
+ * cannot run. Injected as `GIT_CONFIG_*` environment entries (never `-c`
+ * argv flags) so every diff invocation keeps a byte-identical argv.
+ */
+const BOUNDED_DIFF_GIT_CONFIG: Record<string, string> = {
+  "core.bigFileThreshold": String(MAX_REVIEW_FILE_CONTENT_BYTES),
+};
+
+/**
+ * Render a tracked diff without ever asking Git to format an oversized file.
+ *
+ * A raw, no-textconv preflight identifies changed paths and object sizes first.
+ * Every over-limit path is then excluded with a top-level literal pathspec and
+ * represented by a small, parseable binary stub. The stub's object ids retain
+ * a content-sensitive fingerprint without putting file bytes in patch output.
+ *
+ * The size probe is best-effort: every rendered diff also carries
+ * `BOUNDED_DIFF_GIT_CONFIG`, so git itself never formats an oversized blob
+ * even when the probe fails and blob-side exclusion is skipped. Oversized
+ * working-tree sides are excluded from filesystem stat, independent of the
+ * probe.
+ */
+async function buildBoundedTrackedDiff(
+  runtime: ReviewGitRuntime,
+  args: string[],
+  cwd?: string,
+  fingerprintMode = false,
+): Promise<BoundedTrackedDiff> {
+  const diffIndex = args.indexOf("diff");
+  if (diffIndex === -1) throw new Error("Expected a git diff command");
+  // Textconv is disabled only for the machine-readable preflight. The rendered
+  // diff retains Git's normal textconv behavior for sub-threshold paths, while
+  // every oversized path is excluded before that rendered invocation begins.
+  const rawFlags = args.includes("--no-textconv") ? [] : ["--no-textconv"];
+  const rawArgs = [
+    ...args.slice(0, diffIndex + 1),
+    ...rawFlags,
+    "--raw",
+    "-z",
+    "--no-abbrev",
+    ...args.slice(diffIndex + 1),
+  ];
+  const rawResult = assertGitSuccess(await runtime.runGit(rawArgs, { cwd }), rawArgs);
+  const entries = parseRawDiffEntries(rawResult.stdout);
+  if (entries.length === 0) {
+    return {
+      patch: assertGitSuccess(
+        await runtime.runGit(args, { cwd, config: BOUNDED_DIFF_GIT_CONFIG }),
+        args,
+      ).stdout,
+      fingerprintMetadata: [],
+    };
+  }
+
+  const root = await resolveRepoToplevel(runtime, cwd);
+  const oversized: OversizedTrackedDiffEntry[] = [];
+  const fingerprintMetadata: string[] = [];
+  const nonGitlinks = entries.filter((entry) => !isGitlink(entry));
+  const objectSizes = await getGitObjectSizes(
+    runtime,
+    nonGitlinks.flatMap((entry) => [entry.oldObjectId, entry.newObjectId]),
+    cwd,
+  );
+  // A failed batch probe (null) used to mark every object oversized, which
+  // replaced the ENTIRE review with binary stubs and no visible error. The
+  // memory bound no longer depends on the probe:
+  //  - Blob sides live in the object database, where BOUNDED_DIFF_GIT_CONFIG
+  //    makes git itself stub oversized content, so an unknown blob size reads
+  //    as "not oversized" and the file renders (git-bounded) instead of being
+  //    excluded.
+  //  - Working-tree sides are NOT covered by core.bigFileThreshold (git hashes
+  //    the file for the index line and content-based binary detection wins),
+  //    but their sizes come from filesystem stat, not the probe, so that
+  //    exclusion door keeps working below regardless of the probe outcome.
+  //  - An id the probe answered for but could not size (`missing`, omitted,
+  //    unparseable) is unknown, not oversized. git prints such an id for every
+  //    worktree path that rename/copy detection hashed, and for blobs a
+  //    partial clone has not fetched; a file git can plainly diff must never
+  //    be replaced by a content-free binary stub (#1167).
+  const probedSize = (objectId: string): number | null =>
+    isNullObjectId(objectId) || objectSizes === null
+      ? null
+      : objectSizes.get(objectId) ?? null;
+  for (const entry of entries) {
+    if (isGitlink(entry)) continue;
+    const oldSize = probedSize(entry.oldObjectId);
+    const newObjectSize = probedSize(entry.newObjectId);
+    // The working-tree file is what git formats whenever the new side has no
+    // readable object behind it: an unhashed worktree side (all-zero id), or
+    // an id the probe that RAN could not find. Either way its stat size is the
+    // authoritative bound. A probe that FAILED outright says nothing about any
+    // single object, so those ids keep relying on core.bigFileThreshold rather
+    // than on a working-tree file that may not be the diff's new side at all.
+    const newSideUnreadable = isNullObjectId(entry.newObjectId)
+      || (objectSizes !== null && newObjectSize === null);
+    const workingTreeInfo = newSideUnreadable
+      ? await getWorkingTreeFileInfo(runtime, root, entry.newPath)
+      : null;
+    const newSize = newObjectSize ?? workingTreeInfo?.size ?? null;
+    if (oldSize === null && newSize === null) continue;
+    if ((oldSize ?? 0) <= MAX_REVIEW_FILE_CONTENT_BYTES
+      && (newSize ?? 0) <= MAX_REVIEW_FILE_CONTENT_BYTES) {
+      continue;
+    }
+    // Fingerprint polling follows the large-untracked policy: path, byte
+    // size, and mtime avoid re-reading a large file every few seconds. As with
+    // untracked files, same-size edits within a filesystem timestamp tick can
+    // collide; one-shot patch generation still hashes exact content.
+    if (fingerprintMode && workingTreeInfo && entry.newPath) {
+      fingerprintMetadata.push(
+        `large:${entry.newPath}:${workingTreeInfo.size}:${workingTreeInfo.mtimeMs}`,
+      );
+    }
+    // Only an all-zero new side needs a synthesized content-sensitive id. When
+    // git printed a real id it already hashed this exact working-tree content,
+    // so the stub keeps it instead of re-hashing an oversized file.
+    const workingObjectId = !fingerprintMode
+      && isNullObjectId(entry.newObjectId)
+      && workingTreeInfo
+      && entry.newPath
+      ? await hashOversizedWorkingTreeFile(runtime, entry.newPath, workingTreeInfo, cwd)
+      : null;
+    oversized.push({
+      ...entry,
+      newObjectId: workingObjectId ?? entry.newObjectId,
+    });
+  }
+
+  if (oversized.length === 0) {
+    return {
+      patch: assertGitSuccess(
+        await runtime.runGit(args, { cwd, config: BOUNDED_DIFF_GIT_CONFIG }),
+        args,
+      ).stdout,
+      fingerprintMetadata,
+    };
+  }
+
+  const exclusions = oversized.flatMap((entry) => [
+    ...(entry.oldPath ? [`:(top,exclude,literal)${entry.oldPath}`] : []),
+    ...(entry.newPath && entry.newPath !== entry.oldPath
+      ? [`:(top,exclude,literal)${entry.newPath}`]
+      : []),
+  ]);
+  const patchArgs = [...args, "--", ...exclusions];
+  const boundedPatch = assertGitSuccess(
+    await runtime.runGit(patchArgs, { cwd, config: BOUNDED_DIFF_GIT_CONFIG }),
+    patchArgs,
+  ).stdout;
+  return {
+    patch: boundedPatch + oversized.map(buildOversizedTrackedStub).join(""),
+    fingerprintMetadata,
+  };
+}
+
+export async function runBoundedTrackedDiff(
+  runtime: ReviewGitRuntime,
+  args: string[],
+  cwd?: string,
+): Promise<string> {
+  return (await buildBoundedTrackedDiff(runtime, args, cwd)).patch;
+}
+
 async function getUntrackedFileDiffs(
   runtime: ReviewGitRuntime,
   srcPrefix = "a/",
   dstPrefix = "b/",
   cwd?: string,
   options?: GitDiffOptions,
-): Promise<string> {
+  failurePolicy: UntrackedFailurePolicy = "best-effort",
+  includeBinaryPayloads = false,
+): Promise<{ diff: string; paths: string[] }> {
   // git ls-files scopes to the CWD subtree and returns CWD-relative paths,
   // unlike git diff HEAD which always covers the full repo with root-relative
   // paths.  Resolve the repo root so untracked files from the entire repo are
   // included and their paths match the tracked-diff output.
-  const toplevelResult = await runtime.runGit(
-    ["rev-parse", "--show-toplevel"],
-    { cwd },
-  );
-  const rootCwd =
-    toplevelResult.exitCode === 0 ? toplevelResult.stdout.trim() : cwd;
+  const rootCwd = await resolveRepoToplevel(runtime, cwd);
 
   const lsResult = await runtime.runGit(
     ["ls-files", "--others", "--exclude-standard"],
     { cwd: rootCwd },
   );
-  if (lsResult.exitCode !== 0) return "";
+  if (lsResult.exitCode !== 0) {
+    if (failurePolicy === "strict") {
+      assertGitSuccess(lsResult, ["ls-files", "--others", "--exclude-standard"]);
+    }
+    return { diff: "", paths: [] };
+  }
 
+  // ls-files C-quotes unusual paths (unicode, control chars — NOT plain
+  // spaces). The quoted form breaks everything downstream: the --no-index
+  // diff can't access the literal quoted filename (the file silently drops
+  // out of the review), and the returned paths would never match the
+  // unquoted deletion paths in removeTrackedDeletions.
   const files = lsResult.stdout
     .trim()
     .split("\n")
-    .filter((file) => file.length > 0);
+    .filter((file) => file.length > 0)
+    .map((file) => unquoteGitPath(file));
 
-  if (files.length === 0) return "";
+  if (files.length === 0) return { diff: "", paths: [] };
 
-  const diffs = await Promise.all(
-    files.map(async (file) => {
+  const mapWithConcurrency = async <T, R>(
+    items: T[],
+    concurrency: number,
+    mapper: (item: T) => Promise<R>,
+  ): Promise<R[]> => {
+    const results = new Array<R>(items.length);
+    let nextIndex = 0;
+    const workers = Array.from(
+      { length: Math.min(concurrency, items.length) },
+      async () => {
+        while (nextIndex < items.length) {
+          const index = nextIndex++;
+          results[index] = await mapper(items[index]);
+        }
+      },
+    );
+    await Promise.all(workers);
+    return results;
+  };
+
+  const diffs = await mapWithConcurrency(
+    files,
+    MAX_UNTRACKED_DIFF_CONCURRENCY,
+    async (file) => {
+      // Avoid asking Git to inspect arbitrarily large untracked payloads. They
+      // remain visible in the review as binary additions, but their bytes never
+      // enter Git's diff machinery or the server's buffered stdout.
+      let fileInfo: ReviewFileInfo | null = null;
+      try {
+        fileInfo = await runtime.getFileInfo(rootCwd, file);
+      } catch {
+        // Preserve the existing best-effort/strict behavior below: Git reports
+        // the authoritative read error for files that disappear mid-snapshot.
+      }
+      if (
+        !includeBinaryPayloads
+        && fileInfo?.isFile
+        && fileInfo.size > MAX_REVIEW_FILE_CONTENT_BYTES
+      ) {
+        const mode = fileInfo.isExecutable ? "100755" : "100644";
+        const oldToken = formatPatchPathToken("a", file);
+        const newToken = formatPatchPathToken("b", file);
+        return [
+          `diff --git ${oldToken} ${newToken}`,
+          // Same size-cap marker the tracked stub carries (see
+          // buildOversizedTrackedStub) so the UI explains both the same way.
+          OVERSIZED_REVIEW_STUB_MARKER,
+          `new file mode ${mode}`,
+          `Binary files /dev/null and ${newToken} differ`,
+          "",
+        ].join("\n");
+      }
+
       const diffResult = await runtime.runGit(
         [
           "diff",
           "--no-ext-diff",
+          ...(includeBinaryPayloads ? ["--binary", "--full-index"] : []),
           ...(options?.hideWhitespace ? ["-w"] : []),
           "--no-index",
           `--src-prefix=${srcPrefix}`,
@@ -488,11 +1241,131 @@ async function getUntrackedFileDiffs(
         ],
         { cwd: rootCwd },
       );
+      // `git diff --no-index` uses 1 for a normal difference. Anything above
+      // 1 is a real read/command failure: ordinary Git stays best-effort, while
+      // authoritative callers fail closed through the strict policy.
+      if (diffResult.exitCode !== 0 && diffResult.exitCode !== 1) {
+        if (failurePolicy === "best-effort") return "";
+        const stderr = diffResult.stderr.trim();
+        throw new Error(
+          stderr
+            ? `git diff --no-index failed for ${JSON.stringify(file)}: ${stderr}`
+            : `git diff --no-index failed for ${JSON.stringify(file)} with exit code ${diffResult.exitCode}`,
+        );
+      }
       return diffResult.stdout;
-    }),
+    },
   );
 
-  return diffs.join("");
+  return { diff: diffs.join(""), paths: files };
+}
+
+/** How a working-tree diff handles failures while reading untracked files. */
+export type UntrackedFailurePolicy = "best-effort" | "strict";
+
+/**
+ * Diff one already-resolved Git object directly against the working tree,
+ * including untracked files. Unlike `since-base`, this never discovers or
+ * substitutes another base; callers that receive an authoritative base from
+ * another VCS can request the strict policy and fail closed instead of
+ * silently degrading. Ordinary Git uses the best-effort default.
+ */
+export async function getWorkingTreeDiffFromBase(
+  runtime: ReviewGitRuntime,
+  base: string,
+  cwd?: string,
+  options?: GitDiffOptions,
+  untrackedFailurePolicy: UntrackedFailurePolicy = "best-effort",
+): Promise<string> {
+  const args = [
+    "diff",
+    "--no-ext-diff",
+    ...(options?.hideWhitespace ? ["-w"] : []),
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "--end-of-options",
+    base,
+  ];
+  const trackedPatch = await runBoundedTrackedDiff(runtime, args, cwd);
+  const untracked = await getUntrackedFileDiffs(
+    runtime,
+    "a/",
+    "b/",
+    cwd,
+    options,
+    untrackedFailurePolicy,
+  );
+  return removeTrackedDeletions(trackedPatch, new Set(untracked.paths)) + untracked.diff;
+}
+
+/**
+ * Build the exact, applyable patch used to materialize immutable analysis snapshots.
+ *
+ * The ordinary review patch remains bounded and human-readable. This separate
+ * machine patch includes Git binary payloads and full object ids so a binary
+ * file elsewhere in the review cannot make `git apply --binary` reject the
+ * synthetic snapshot.
+ */
+export async function getGitSnapshotMaterializationPatch(
+  runtime: ReviewGitRuntime,
+  diffType: DiffType,
+  defaultBranch: string = "main",
+  externalCwd?: string,
+): Promise<string | null> {
+  let cwd = externalCwd;
+  let effectiveDiffType = diffType as string;
+  const worktree = parseWorktreeDiffType(effectiveDiffType);
+  if (effectiveDiffType.startsWith("worktree:")) {
+    if (!worktree) throw new Error("Could not parse the worktree snapshot.");
+    cwd = worktree.path;
+    effectiveDiffType = worktree.subType;
+  }
+  if (
+    effectiveDiffType !== "since-base"
+    && effectiveDiffType !== "uncommitted"
+    && effectiveDiffType !== "staged"
+    && effectiveDiffType !== "unstaged"
+  ) {
+    return null;
+  }
+
+  const binaryDiff = async (args: string[]): Promise<string> =>
+    assertGitSuccess(await runtime.runGit(args, { cwd }), args).stdout;
+  const common = [
+    "diff",
+    "--no-ext-diff",
+    "--binary",
+    "--full-index",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+  ];
+  const untracked = async (): Promise<{ diff: string; paths: string[] }> =>
+    getUntrackedFileDiffs(runtime, "a/", "b/", cwd, undefined, "strict", true);
+
+  if (effectiveDiffType === "staged") {
+    return binaryDiff([...common, "--staged"]);
+  }
+  if (effectiveDiffType === "unstaged") {
+    const files = await untracked();
+    const tracked = await binaryDiff(common);
+    return removeTrackedDeletions(tracked, new Set(files.paths)) + files.diff;
+  }
+
+  const hasHead = (await runtime.runGit(["rev-parse", "--verify", "HEAD"], { cwd })).exitCode === 0;
+  const files = await untracked();
+  if (!hasHead) return files.diff;
+  if (effectiveDiffType === "uncommitted") {
+    const tracked = await binaryDiff([...common, "HEAD"]);
+    return removeTrackedDeletions(tracked, new Set(files.paths)) + files.diff;
+  }
+
+  const mergeBaseResult = await runtime.runGit(
+    ["merge-base", "--end-of-options", defaultBranch, "HEAD"],
+    { cwd },
+  );
+  const mergeBase = mergeBaseResult.exitCode === 0 ? mergeBaseResult.stdout.trim() : "HEAD";
+  const tracked = await binaryDiff([...common, "--end-of-options", mergeBase]);
+  return removeTrackedDeletions(tracked, new Set(files.paths)) + files.diff;
 }
 
 /**
@@ -501,6 +1374,18 @@ async function getUntrackedFileDiffs(
  */
 function displayRef(ref: string): string {
   return /^[0-9a-f]{7,}$/i.test(ref) ? ref.slice(0, 7) : ref;
+}
+
+/** Resolve the empty-tree object id (hash-object honors repo hash algorithm;
+ * the SHA-1 constant is the fallback for the degenerate no-repo case). */
+export async function getEmptyTreeSha(
+  runtime: ReviewGitRuntime,
+  cwd?: string,
+): Promise<string> {
+  const result = await runtime.runGit(["hash-object", "-t", "tree", "--stdin"], { cwd });
+  return result.exitCode === 0
+    ? result.stdout.trim()
+    : "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 }
 
 function assertGitSuccess(
@@ -518,7 +1403,14 @@ function assertGitSuccess(
   );
 }
 
+// LOCKSTEP: packages/review-editor/App.tsx's activeWorktreePath memo
+// hand-parses worktree: diffTypes with a COPY of this list. Adding a
+// subtype here without updating that copy makes the client derive a
+// different worktreePath than the server stamped on guide/tour jobs,
+// silently breaking their context matching. Real fix (cleanup PR):
+// extract the pure parser to a browser-safe module.
 const WORKTREE_SUB_TYPES = new Set([
+  "since-base",
   "uncommitted",
   "staged",
   "unstaged",
@@ -528,21 +1420,74 @@ const WORKTREE_SUB_TYPES = new Set([
   "all",
 ]);
 
+/** Bare hex object name (full or abbreviated) — the only sha shape accepted
+ * from clients before it reaches a git argv position. */
+export const BARE_HEX_SHA_RE = /^[0-9a-f]{4,64}$/i;
+
+/**
+ * Parse a `commit:<sha>` diff type — a single historical commit reviewed
+ * against its first parent. The sha must be plain hex (full or abbreviated):
+ * it flows from a client request into git argv positions, so anything that
+ * isn't a bare object name is rejected here rather than trusted downstream
+ * (`--end-of-options` already prevents flag smuggling; this keeps revspec
+ * operators like `..`/`^{}` out too, so the diff is always one commit).
+ */
+export function parseCommitDiffType(diffType: string): { sha: string } | null {
+  if (!diffType.startsWith("commit:")) return null;
+  const sha = diffType.slice("commit:".length);
+  return BARE_HEX_SHA_RE.test(sha) ? { sha } : null;
+}
+
+/**
+ * True when switching to `nextDiffType` is a commit:<sha> diff within the
+ * same cwd as `previousDiffType` (plain or worktree-prefixed). The commit-rail
+ * hot path: such a switch cannot change branches, worktrees, or recent
+ * commits, so the /api/diff/switch handlers skip their gitContext recompute.
+ * Only the NEW type must be a commit diff — the context is invalidated by
+ * where you land, not where you came from.
+ */
+export function isSameCwdCommitSwitch(
+  previousDiffType: string,
+  nextDiffType: string,
+): boolean {
+  const next = parseWorktreeDiffType(nextDiffType);
+  if (!parseCommitDiffType(next?.subType ?? nextDiffType)) return false;
+  return (next?.path ?? null) === (parseWorktreeDiffType(previousDiffType)?.path ?? null);
+}
+
 export function parseWorktreeDiffType(
   diffType: string,
 ): { path: string; subType: string } | null {
   if (!diffType.startsWith("worktree:")) return null;
 
   const rest = diffType.slice("worktree:".length);
+  // `worktree:<path>:commit:<sha>` — the sub-type itself contains a colon, so
+  // it can't be recognized by the single lastIndexOf(':') split below. Split
+  // on the LAST ':commit:' occurrence (a path that itself ends in ':commit'
+  // followed by a hex segment would be misread — accepted pathological edge).
+  // An empty worktree path is never valid: it would resolve to an empty cwd,
+  // and Bun.spawn({ cwd: "" }) silently runs git in the SERVER's own directory
+  // rather than the target repo — leaking an unrelated checkout's diff. Treat a
+  // missing path as unparseable so callers fall back to their real cwd.
+  const finalize = (path: string, subType: string) =>
+    path === "" ? null : { path, subType };
+
+  const commitIdx = rest.lastIndexOf(":commit:");
+  if (commitIdx !== -1) {
+    const maybeCommit = rest.slice(commitIdx + 1);
+    if (parseCommitDiffType(maybeCommit)) {
+      return finalize(rest.slice(0, commitIdx), maybeCommit);
+    }
+  }
   const lastColon = rest.lastIndexOf(":");
   if (lastColon !== -1) {
     const maybeSub = rest.slice(lastColon + 1);
     if (WORKTREE_SUB_TYPES.has(maybeSub)) {
-      return { path: rest.slice(0, lastColon), subType: maybeSub };
+      return finalize(rest.slice(0, lastColon), maybeSub);
     }
   }
 
-  return { path: rest, subType: "uncommitted" };
+  return finalize(rest, "uncommitted");
 }
 
 export async function runGitDiff(
@@ -573,33 +1518,86 @@ export async function runGitDiff(
   const wFlag = options?.hideWhitespace ? ["-w"] : [];
 
   try {
-    switch (effectiveDiffType) {
+    // `commit:<sha>` — one historical commit vs its first parent (git-show
+    // style). Handled before the switch: the sha makes it a family of types,
+    // not a literal case label.
+    const commitRef = parseCommitDiffType(effectiveDiffType);
+    if (commitRef) {
+      const { sha } = commitRef;
+      const infoArgs = ["log", "-1", `--pretty=format:%h${COMMIT_FIELD_SEP}%s`, "--end-of-options", sha];
+      const info = assertGitSuccess(await runtime.runGit(infoArgs, { cwd }), infoArgs);
+      const sepIdx = info.stdout.indexOf(COMMIT_FIELD_SEP);
+      const shortSha = sepIdx === -1 ? sha.slice(0, 7) : info.stdout.slice(0, sepIdx);
+      const subject = sepIdx === -1 ? "" : info.stdout.slice(sepIdx + 1).split("\n")[0];
+      // Root commit has no parent — diff against the empty tree instead.
+      const hasParent =
+        (await runtime.runGit(["rev-parse", "--verify", "--quiet", `${sha}^`], { cwd }))
+          .exitCode === 0;
+      const baseRef = hasParent ? `${sha}^` : await getEmptyTreeSha(runtime, cwd);
+      const commitDiffArgs = [
+        "diff",
+        "--no-ext-diff",
+        ...wFlag,
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "--end-of-options",
+        `${baseRef}..${sha}`,
+      ];
+      patch = await runBoundedTrackedDiff(runtime, commitDiffArgs, cwd);
+      label = subject ? `Commit ${shortSha} — ${subject}` : `Commit ${shortSha}`;
+    } else if (effectiveDiffType.startsWith("commit:")) {
+      return { patch: "", label: `Error: ${diffType}`, error: "Invalid commit ref" };
+    } else switch (effectiveDiffType) {
+      case "since-base": {
+        // The composite "GitHub view": merge-base(base, HEAD) vs the working
+        // tree (note: no right-hand ref on the diff), plus untracked files.
+        // Exactly what a PR would show if the user committed and pushed now.
+        const hasHead =
+          (await runtime.runGit(["rev-parse", "--verify", "HEAD"], { cwd }))
+            .exitCode === 0;
+        let trackedPatch = "";
+        if (hasHead) {
+          // Resolve the merge-base with the requested base. When the base
+          // doesn't exist (repo with no main/master/origin — e.g. a `trunk`
+          // default and no remote) merge-base fails; degrade to HEAD so the
+          // reviewer still sees their working-tree changes instead of a raw
+          // git error. The sections sidecar degrades the same way.
+          const mergeBaseResult = await runtime.runGit(
+            ["merge-base", "--end-of-options", defaultBranch, "HEAD"],
+            { cwd },
+          );
+          const mergeBase = mergeBaseResult.exitCode === 0
+            ? mergeBaseResult.stdout.trim()
+            : "HEAD";
+          trackedPatch = await getWorkingTreeDiffFromBase(runtime, mergeBase, cwd, options);
+        }
+        if (hasHead) {
+          patch = trackedPatch;
+        } else {
+          const untracked = await getUntrackedFileDiffs(runtime, "a/", "b/", cwd, options);
+          patch = untracked.diff;
+        }
+        label = `All changes since ${displayRef(defaultBranch)}`;
+        break;
+      }
+
       case "uncommitted": {
         const trackedDiffArgs = [
           "diff",
           "--no-ext-diff",
           ...wFlag,
-          "HEAD",
           "--src-prefix=a/",
           "--dst-prefix=b/",
+          "HEAD",
         ];
         const hasHead =
           (await runtime.runGit(["rev-parse", "--verify", "HEAD"], { cwd }))
             .exitCode === 0;
         const trackedPatch = hasHead
-          ? assertGitSuccess(
-              await runtime.runGit(trackedDiffArgs, { cwd }),
-              trackedDiffArgs,
-            ).stdout
+          ? await runBoundedTrackedDiff(runtime, trackedDiffArgs, cwd)
           : "";
-        const untrackedDiff = await getUntrackedFileDiffs(
-          runtime,
-          "a/",
-          "b/",
-          cwd,
-          options,
-        );
-        patch = trackedPatch + untrackedDiff;
+        const untracked = await getUntrackedFileDiffs(runtime, "a/", "b/", cwd, options);
+        patch = removeTrackedDeletions(trackedPatch, new Set(untracked.paths)) + untracked.diff;
         label = "Uncommitted changes";
         break;
       }
@@ -613,11 +1611,7 @@ export async function runGitDiff(
           "--src-prefix=a/",
           "--dst-prefix=b/",
         ];
-        const stagedDiff = assertGitSuccess(
-          await runtime.runGit(stagedDiffArgs, { cwd }),
-          stagedDiffArgs,
-        );
-        patch = stagedDiff.stdout;
+        patch = await runBoundedTrackedDiff(runtime, stagedDiffArgs, cwd);
         label = "Staged changes";
         break;
       }
@@ -630,18 +1624,11 @@ export async function runGitDiff(
           "--src-prefix=a/",
           "--dst-prefix=b/",
         ];
-        const trackedDiff = assertGitSuccess(
-          await runtime.runGit(trackedDiffArgs, { cwd }),
-          trackedDiffArgs,
-        );
-        const untrackedDiff = await getUntrackedFileDiffs(
-          runtime,
-          "a/",
-          "b/",
-          cwd,
-          options,
-        );
-        patch = trackedDiff.stdout + untrackedDiff;
+        const untracked = await getUntrackedFileDiffs(runtime, "a/", "b/", cwd, options);
+        patch = removeTrackedDeletions(
+          await runBoundedTrackedDiff(runtime, trackedDiffArgs, cwd),
+          new Set(untracked.paths),
+        ) + untracked.diff;
         label = "Unstaged changes";
         break;
       }
@@ -653,13 +1640,9 @@ export async function runGitDiff(
         );
         const args =
           hasParent.exitCode === 0
-            ? ["diff", "--no-ext-diff", ...wFlag, "HEAD~1..HEAD", "--src-prefix=a/", "--dst-prefix=b/"]
-            : ["diff", "--no-ext-diff", ...wFlag, "--root", "HEAD", "--src-prefix=a/", "--dst-prefix=b/"];
-        const lastCommitDiff = assertGitSuccess(
-          await runtime.runGit(args, { cwd }),
-          args,
-        );
-        patch = lastCommitDiff.stdout;
+            ? ["diff", "--no-ext-diff", ...wFlag, "--src-prefix=a/", "--dst-prefix=b/", "HEAD~1..HEAD"]
+            : ["diff", "--no-ext-diff", ...wFlag, "--src-prefix=a/", "--dst-prefix=b/", "--root", "HEAD"];
+        patch = await runBoundedTrackedDiff(runtime, args, cwd);
         label = "Last commit";
         break;
       }
@@ -678,11 +1661,7 @@ export async function runGitDiff(
           "--end-of-options",
           `${defaultBranch}..HEAD`,
         ];
-        const branchDiff = assertGitSuccess(
-          await runtime.runGit(branchDiffArgs, { cwd }),
-          branchDiffArgs,
-        );
-        patch = branchDiff.stdout;
+        patch = await runBoundedTrackedDiff(runtime, branchDiffArgs, cwd);
         label = `Changes vs ${displayRef(defaultBranch)}`;
         break;
       }
@@ -703,21 +1682,14 @@ export async function runGitDiff(
           "--end-of-options",
           `${mergeBase}..HEAD`,
         ];
-        const mergeBaseDiff = assertGitSuccess(
-          await runtime.runGit(mergeBaseDiffArgs, { cwd }),
-          mergeBaseDiffArgs,
-        );
-        patch = mergeBaseDiff.stdout;
+        patch = await runBoundedTrackedDiff(runtime, mergeBaseDiffArgs, cwd);
         label = `PR diff vs ${displayRef(defaultBranch)}`;
         break;
       }
 
       case "all": {
         // Diff from the empty tree to HEAD — shows every tracked file as an addition.
-        const emptyTreeResult = await runtime.runGit(["hash-object", "-t", "tree", "/dev/null"], { cwd });
-        const emptyTree = emptyTreeResult.exitCode === 0
-          ? emptyTreeResult.stdout.trim()
-          : "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+        const emptyTree = await getEmptyTreeSha(runtime, cwd);
         const allDiffArgs = [
           "diff",
           "--no-ext-diff",
@@ -727,11 +1699,7 @@ export async function runGitDiff(
           "--end-of-options",
           `${emptyTree}..HEAD`,
         ];
-        const allDiff = assertGitSuccess(
-          await runtime.runGit(allDiffArgs, { cwd }),
-          allDiffArgs,
-        );
-        patch = allDiff.stdout;
+        patch = await runBoundedTrackedDiff(runtime, allDiffArgs, cwd);
         label = "All files";
         break;
       }
@@ -801,6 +1769,116 @@ export function hashFingerprintPart(value: string): string {
 
 const MAX_UNTRACKED_FINGERPRINT_FILES = 20;
 
+/**
+ * Circuit-breaker for the fingerprint's untracked enumeration. The freshness
+ * poll runs `git status --porcelain -uall` every few seconds; on a repo with
+ * a huge un-ignored tree (a forgotten `node_modules/`) that's megabytes of
+ * output and sustained CPU for the whole session. Once a cwd's -uall output
+ * exceeds the cap, it degrades PERMANENTLY (per process) to collapsed
+ * `-unormal` — edits INSIDE untracked directories stop flipping the
+ * fingerprint on that repo, which is the right trade on a repo that
+ * pathological. The switch itself makes one probe hash differently, so the
+ * staleness banner may fire once spuriously right after degrading.
+ */
+const UNTRACKED_STATUS_OUTPUT_CAP = 2 * 1024 * 1024;
+const collapsedUntrackedCwds = new Set<string>();
+
+type ReadOnlyGitRunner = (
+  args: string[],
+  options?: GitCommandOptions,
+) => Promise<GitCommandResult>;
+
+async function appendDiffFingerprint(
+  runReadOnlyGit: ReadOnlyGitRunner,
+  runtime: ReviewGitRuntime,
+  parts: string[],
+  whitespaceArgs: string[],
+  args: string[],
+): Promise<boolean> {
+  try {
+    const diff = await buildBoundedTrackedDiff(
+      {
+        runGit: (diffArgs, options) => runReadOnlyGit(diffArgs, options),
+        readTextFile: async () => null,
+        getFileInfo: runtime.getFileInfo,
+        readLink: runtime.readLink,
+      },
+      ["diff", "--no-ext-diff", ...whitespaceArgs, ...args],
+      undefined,
+      true,
+    );
+    parts.push(hashFingerprintPart(diff.patch), ...diff.fingerprintMetadata);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function appendUntrackedFingerprint(
+  runtime: ReviewGitRuntime,
+  runReadOnlyGit: ReadOnlyGitRunner,
+  parts: string[],
+  cwd?: string,
+): Promise<boolean> {
+  // -uall: without it, an untracked directory collapses to a single `?? dir/`
+  // line, so edits to files inside it never change the fingerprint and the
+  // "Diff out of date" banner never fires — even though the patch enumerates
+  // individual files. Permanently collapse a pathological repo after its
+  // output crosses the circuit-breaker cap.
+  const cwdKey = cwd ?? "";
+  const collapsed = collapsedUntrackedCwds.has(cwdKey);
+  const status = await runReadOnlyGit([
+    "status",
+    "--porcelain",
+    collapsed ? "-unormal" : "-uall",
+  ]);
+  if (status.exitCode !== 0) return false;
+  if (!collapsed && status.stdout.length > UNTRACKED_STATUS_OUTPUT_CAP) {
+    collapsedUntrackedCwds.add(cwdKey);
+  }
+  parts.push(hashFingerprintPart(status.stdout));
+  const untracked = status.stdout
+    .split("\n")
+    .filter((line) => line.startsWith("?? "))
+    .map((line) => unquoteGitPath(line.slice(3).trim()))
+    .slice(0, MAX_UNTRACKED_FINGERPRINT_FILES);
+  if (untracked.length > 0) {
+    const baseDir = await resolveRepoToplevel(runtime, cwd);
+    for (const path of untracked) {
+      try {
+        const fileInfo = await runtime.getFileInfo(baseDir, path);
+        if (!fileInfo) {
+          parts.push("unreadable");
+          continue;
+        }
+        if (fileInfo.isSymbolicLink) {
+          // Hash the link payload Git records without following it into a
+          // potentially huge target file.
+          const link = await runtime.readLink(fileInfo.path);
+          parts.push(link != null ? hashFingerprintPart(`symlink:${link}`) : "unreadable");
+          continue;
+        }
+        if (!fileInfo.isFile) {
+          parts.push(`non-file:${fileInfo.size}:${fileInfo.mtimeMs}`);
+          continue;
+        }
+        if (fileInfo.size > MAX_UNTRACKED_FINGERPRINT_CONTENT_BYTES) {
+          // A metadata fingerprint avoids decoding a multi-GB binary into a JS
+          // string every five seconds. Size/mtime changes still invalidate the
+          // review, while small files retain content-accurate detection.
+          parts.push(`large:${fileInfo.size}:${fileInfo.mtimeMs}`);
+          continue;
+        }
+        const content = await runtime.readTextFile(fileInfo.path);
+        parts.push(content != null ? hashFingerprintPart(content) : "unreadable");
+      } catch {
+        parts.push("unreadable");
+      }
+    }
+  }
+  return true;
+}
+
 export async function getGitDiffFingerprint(
   runtime: ReviewGitRuntime,
   diffType: DiffType,
@@ -824,41 +1902,57 @@ export async function getGitDiffFingerprint(
     // every few seconds) and must NEVER take git's index lock — `status`/`diff`
     // opportunistically refresh the index by default, which races concurrent
     // `git add`/commit operations (the agent working while the user reviews).
-    const runReadOnlyGit = (args: string[]) =>
-      runtime.runGit(["--no-optional-locks", ...args], { cwd });
+    const runReadOnlyGit = (args: string[], options?: GitCommandOptions) =>
+      runtime.runGit(["--no-optional-locks", ...args], { ...options, cwd });
+
+    // commit:<sha> — the diff is anchored to an immutable object, so the
+    // fingerprint is the sha plus whether it still resolves. Deliberately NOT
+    // headSha-coupled: new commits landing mid-review don't change this diff,
+    // so they must not raise the staleness banner. If the commit vanishes from
+    // the repo (rebase + gc), present→gone flips the fingerprint and the
+    // banner fires — refreshing then surfaces the git error honestly.
+    if (effectiveDiffType.startsWith("commit:")) {
+      const commitRef = parseCommitDiffType(effectiveDiffType);
+      if (!commitRef) return null;
+      const resolves =
+        (await runReadOnlyGit(["rev-parse", "--verify", "--quiet", `${commitRef.sha}^{commit}`]))
+          .exitCode === 0;
+      return `git:commit:${commitRef.sha}:${resolves ? "present" : "gone"}`;
+    }
 
     const head = await runReadOnlyGit(["rev-parse", "HEAD"]);
     const headSha = head.exitCode === 0 ? head.stdout.trim() : "no-head";
     const parts = ["git", effectiveDiffType, headSha];
 
-    const hashDiffOutput = async (args: string[]): Promise<boolean> => {
-      const result = await runReadOnlyGit(["diff", "--no-ext-diff", ...wFlag, ...args]);
-      if (result.exitCode !== 0) return false;
-      parts.push(hashFingerprintPart(result.stdout));
-      return true;
-    };
+    const hashDiffOutput = (args: string[]): Promise<boolean> =>
+      appendDiffFingerprint(runReadOnlyGit, runtime, parts, wFlag, args);
 
     // Untracked files: porcelain `??` lines capture existence; hash their
     // contents too so editing a freshly-created (untracked) file is detected.
     // Capped — a pathological number of untracked files degrades to
     // existence-only detection rather than unbounded reads.
-    const hashUntracked = async (): Promise<boolean> => {
-      const status = await runReadOnlyGit(["status", "--porcelain"]);
-      if (status.exitCode !== 0) return false;
-      parts.push(hashFingerprintPart(status.stdout));
-      const untracked = status.stdout
-        .split("\n")
-        .filter((line) => line.startsWith("?? "))
-        .map((line) => line.slice(3).trim())
-        .slice(0, MAX_UNTRACKED_FINGERPRINT_FILES);
-      for (const path of untracked) {
-        const content = await runtime.readTextFile(cwd ? resolvePath(cwd, path) : path);
-        parts.push(content != null ? hashFingerprintPart(content) : "unreadable");
-      }
-      return true;
-    };
+    const hashUntracked = (): Promise<boolean> =>
+      appendUntrackedFingerprint(runtime, runReadOnlyGit, parts, cwd);
 
     switch (effectiveDiffType) {
+      case "since-base": {
+        // Content hash of the mb→worktree diff catches edits; headSha (always
+        // in `parts`) catches commits that only re-partition the sections;
+        // the status hash inside hashUntracked catches stage/unstage flips.
+        if (headSha !== "no-head") {
+          // Degrade to HEAD when merge-base fails (base ref unresolvable, or the
+          // base and HEAD have unrelated histories). runGitDiff/getSinceBaseSections/
+          // getFileContentsForDiff all fall back to HEAD; the fingerprint must too,
+          // or `null` here would report "always fresh" and the staleness banner
+          // would never fire for the whole session on such repos.
+          const mb = await runReadOnlyGit(["merge-base", "--end-of-options", defaultBranch, "HEAD"]);
+          const mergeBase = mb.exitCode === 0 ? mb.stdout.trim() : "HEAD";
+          parts.push(mergeBase);
+          if (!(await hashDiffOutput(["--end-of-options", mergeBase]))) return null;
+        }
+        if (!(await hashUntracked())) return null;
+        break;
+      }
       case "uncommitted": {
         if (headSha !== "no-head" && !(await hashDiffOutput(["HEAD"]))) return null;
         if (!(await hashUntracked())) return null;
@@ -911,17 +2005,62 @@ export async function getFileContentsForDiff(
   }
 
   async function gitShow(ref: string, path: string): Promise<string | null> {
+    const object = `${ref}:${path}`;
+    const sizeResult = await runtime.runGit(
+      ["cat-file", "-s", "--", object],
+      { cwd },
+    );
+    if (sizeResult.exitCode !== 0) return null;
+    const size = Number(sizeResult.stdout.trim());
+    if (!Number.isFinite(size) || size > MAX_REVIEW_FILE_CONTENT_BYTES) return null;
     // `--end-of-options` hardens against user-supplied refs starting with `-`.
-    const result = await runtime.runGit(["show", "--end-of-options", `${ref}:${path}`], { cwd });
+    const result = await runtime.runGit(["show", "--end-of-options", object], { cwd });
     return result.exitCode === 0 ? result.stdout : null;
   }
 
   async function readWorkingTree(path: string): Promise<string | null> {
-    const fullPath = cwd ? resolvePath(cwd, path) : path;
-    return runtime.readTextFile(fullPath);
+    // Patch paths are repo-root-relative; resolve against the toplevel, not
+    // cwd — from a subdirectory launch, cwd-resolution double-prefixes the
+    // path and hunk expansion silently returns null. (The `git show ref:path`
+    // sibling is immune: ref paths are root-relative regardless of cwd.)
+    const baseDir = await resolveRepoToplevel(runtime, cwd);
+    try {
+      const fileInfo = await runtime.getFileInfo(baseDir, path);
+      if (!fileInfo) return null;
+      // Git stores the link destination as the blob contents. Reading the link
+      // itself preserves expansion without following an arbitrarily large
+      // target.
+      if (fileInfo.isSymbolicLink) return await runtime.readLink(fileInfo.path);
+      if (!fileInfo.isFile || fileInfo.size > MAX_REVIEW_FILE_CONTENT_BYTES) return null;
+      return runtime.readTextFile(fileInfo.path);
+    } catch {
+      return null;
+    }
+  }
+
+  // commit:<sha> — old side is the first parent (null on a root commit, which
+  // correctly renders every file as an addition), new side the commit itself.
+  const commitRef = parseCommitDiffType(effectiveDiffType);
+  if (commitRef) {
+    return {
+      oldContent: await gitShow(`${commitRef.sha}^`, oldFilePath),
+      newContent: await gitShow(commitRef.sha, filePath),
+    };
   }
 
   switch (effectiveDiffType) {
+    case "since-base": {
+      const mbResult = await runtime.runGit(["merge-base", "--end-of-options", defaultBranch, "HEAD"], { cwd });
+      // Degrade to HEAD (matching runGitDiff), not defaultBranch — when the base
+      // doesn't resolve, the patch is computed against HEAD, so the expanded
+      // old-side content must come from HEAD too or it won't match what the
+      // reviewer is reading.
+      const mb = mbResult.exitCode === 0 ? mbResult.stdout.trim() : "HEAD";
+      return {
+        oldContent: await gitShow(mb, oldFilePath),
+        newContent: await readWorkingTree(filePath),
+      };
+    }
     case "uncommitted":
       return {
         oldContent: await gitShow("HEAD", oldFilePath),
@@ -965,6 +2104,154 @@ export async function getFileContentsForDiff(
   }
 }
 
+// --- Since-base sections -----------------------------------------------------
+//
+// The "since-base" composite diff is one patch (merge-base → working tree +
+// untracked); the UI's three-stack panel groups its files by lifecycle state.
+// This sidecar carries that grouping. Per-file A/M/D/R status is NOT here —
+// the client already derives it from the patch itself.
+
+export interface SinceBaseSectionEntry {
+  group: "committed" | "changes" | "untracked";
+  /** True when the file has staged (index) changes — porcelain column X.
+   *  SNAPSHOT value from when the sidecar was computed. For DISPLAY, always
+   *  render from the client's effective stagedFiles set (useGitAdd folds
+   *  this in with session overrides) — never OR this flag back in, or files
+   *  unstaged mid-session keep a stale staged indicator. */
+  staged: boolean;
+}
+
+export interface SinceBaseSections {
+  /** The base ref the merge-base was computed against, e.g. `origin/main`. */
+  base: string;
+  /** Resolved merge-base SHA ("" when the repo has no HEAD yet). */
+  mergeBase: string;
+  /** Repo-root-relative path → section entry. Paths match the patch's. */
+  files: Record<string, SinceBaseSectionEntry>;
+}
+
+/**
+ * Split a porcelain rename/copy path token (`<from> -> <to>`) into its two
+ * sides. Git double-quotes a side when it contains a double quote, backslash,
+ * control char, or (with core.quotePath on) non-ASCII — in those cases the
+ * real separator is the ` -> ` OUTSIDE the quoted span, so a leading quote is
+ * skipped before searching. Plain spaces are NOT quoted by porcelain v1,
+ * which means a filename literally containing ` -> ` (and nothing else
+ * unusual) is emitted unquoted and ambiguous — only `--porcelain -z` fully
+ * disambiguates. Accepted edge: such a name splits at its first separator
+ * and both sides misgroup to "committed" in the sidebar; nothing else breaks.
+ * Returns [from, to] for a rename/copy, or [token] otherwise.
+ */
+export function splitPorcelainRename(rest: string): string[] {
+  let searchFrom = 0;
+  if (rest.startsWith('"')) {
+    // Skip past the closing quote of the (quoted) from-path, honoring \" escapes.
+    let i = 1;
+    for (; i < rest.length; i++) {
+      if (rest[i] === "\\") { i++; continue; }
+      if (rest[i] === '"') { i++; break; }
+    }
+    searchFrom = i;
+  }
+  const sep = rest.indexOf(" -> ", searchFrom);
+  return sep !== -1 ? [rest.slice(0, sep), rest.slice(sep + 4)] : [rest];
+}
+
+/**
+ * Partition the since-base file set by `git status` state:
+ *  - `??`                → untracked
+ *  - any other dirty XY  → changes (staged = column X is set)
+ *  - in mb..HEAD, clean  → committed
+ *
+ * Best-effort: returns null when the repo can't answer (callers omit the
+ * sidecar rather than failing the diff).
+ */
+export async function getSinceBaseSections(
+  runtime: ReviewGitRuntime,
+  defaultBranch: string,
+  cwd?: string,
+): Promise<SinceBaseSections | null> {
+  try {
+    // --no-optional-locks: never take the index lock for a read-only sidecar
+    // (the agent may be running git concurrently). -uall lists untracked
+    // files individually so entries match the patch's per-file paths instead
+    // of collapsing whole untracked directories.
+    const status = await runtime.runGit(
+      ["--no-optional-locks", "status", "--porcelain", "-uall"],
+      { cwd },
+    );
+    if (status.exitCode !== 0) return null;
+
+    const files: Record<string, SinceBaseSectionEntry> = {};
+    for (const line of status.stdout.split("\n")) {
+      if (line.length < 4) continue;
+      const x = line[0];
+      const y = line[1];
+      const rest = line.slice(3);
+
+      if (x === "?" && y === "?") {
+        // Untracked. Don't clobber an existing tracked entry for the same
+        // path: `git rm --cached f` emits BOTH `D  f` (staged delete) and
+        // `?? f` (now-untracked file) — the tracked/staged signal wins.
+        const path = unquoteGitPath(rest.trim());
+        if (path && !files[path]) files[path] = { group: "untracked", staged: false };
+        continue;
+      }
+
+      // Tracked change (always wins over a prior untracked entry). Renames /
+      // copies list `orig -> dest`; record BOTH sides as changes. If a rename
+      // is followed by a working-tree edit that drops similarity below git's
+      // threshold, the since-base patch emits SEPARATE delete(orig)+add(dest)
+      // chunks — recording only dest would leave the deleted `orig` half with
+      // no sidecar entry, defaulting it to Committed. Both-sides prevents that.
+      const staged = x !== " " && x !== "?";
+      for (const token of splitPorcelainRename(rest)) {
+        const path = unquoteGitPath(token.trim());
+        if (path) files[path] = { group: "changes", staged };
+      }
+    }
+
+    let mergeBase = "";
+    const hasHead =
+      (await runtime.runGit(["--no-optional-locks", "rev-parse", "--verify", "HEAD"], { cwd }))
+        .exitCode === 0;
+    if (hasHead) {
+      const mbResult = await runtime.runGit(
+        ["--no-optional-locks", "merge-base", "--end-of-options", defaultBranch, "HEAD"],
+        { cwd },
+      );
+      // Degrade to HEAD when the base can't be resolved (matches runGitDiff):
+      // the "committed since base" set becomes empty rather than nulling the
+      // whole sidecar, so the panel still renders Changes/Untracked.
+      mergeBase = mbResult.exitCode === 0 ? mbResult.stdout.trim() : "HEAD";
+
+      const committed = await runtime.runGit(
+        [
+          "--no-optional-locks",
+          "diff",
+          "--no-ext-diff",
+          "--name-only",
+          "--end-of-options",
+          `${mergeBase}..HEAD`,
+        ],
+        { cwd },
+      );
+      if (committed.exitCode !== 0) return null;
+      for (const line of committed.stdout.split("\n")) {
+        const path = unquoteGitPath(line.trim());
+        if (!path) continue;
+        // Dirty state wins: a file with both committed and working-tree
+        // changes lives in "changes" (its diff still shows the full story).
+        if (!files[path]) files[path] = { group: "committed", staged: false };
+      }
+    }
+
+    return { base: defaultBranch, mergeBase, files };
+  } catch {
+    return null;
+  }
+}
+
 export function validateFilePath(filePath: string): void {
   if (filePath.includes("..") || filePath.startsWith("/")) {
     throw new Error("Invalid file path");
@@ -988,7 +2275,10 @@ export async function gitAddFile(
   cwd?: string,
 ): Promise<void> {
   validateFilePath(filePath);
-  await ensureGitSuccess(runtime, ["add", "--", filePath], cwd);
+  // Patch paths are repo-root-relative; from a subdirectory launch the
+  // pathspec must be applied at the toplevel or `git add` fails with
+  // "did not match any files".
+  await ensureGitSuccess(runtime, ["add", "--", filePath], await resolveRepoToplevel(runtime, cwd));
 }
 
 export async function gitResetFile(
@@ -997,7 +2287,8 @@ export async function gitResetFile(
   cwd?: string,
 ): Promise<void> {
   validateFilePath(filePath);
-  await ensureGitSuccess(runtime, ["reset", "HEAD", "--", filePath], cwd);
+  // Toplevel for the same reason as gitAddFile.
+  await ensureGitSuccess(runtime, ["reset", "HEAD", "--", filePath], await resolveRepoToplevel(runtime, cwd));
 }
 
 export function parseP4DiffType(
@@ -1012,4 +2303,74 @@ export function parseP4DiffType(
 
 export function isP4DiffType(diffType: string): boolean {
   return parseP4DiffType(diffType) !== null;
+}
+
+/**
+ * Extract per-file path + line-count stats from a raw unified diff patch.
+ * Mirrors the client's packages/review-editor/utils/diffParser.ts chunk-split
+ * and additions/deletions counting logic, but only needs path/additions/
+ * deletions (no status/oldPath) — used server-side to give agent-job
+ * providers (e.g. Guided Review) the authoritative changed-file set to plan
+ * against, without duplicating the VCS-agnostic diff-splitting logic.
+ */
+export function listPatchFiles(
+  patch: string,
+): { path: string; additions: number; deletions: number }[] {
+  if (!patch) return [];
+
+  const chunkStarts = [...patch.matchAll(/^diff --git /gm)];
+  if (chunkStarts.length === 0) return [];
+
+  const files: { path: string; additions: number; deletions: number }[] = [];
+
+  for (let i = 0; i < chunkStarts.length; i++) {
+    const start = chunkStarts[i].index ?? 0;
+    const end = chunkStarts[i + 1]?.index ?? patch.length;
+    const lines = patch.slice(start, end).split("\n");
+
+    // Prefer the --- /+++ path lines (present on every non-mode-only chunk);
+    // fall back to the "diff --git a/x b/y" header for the rare chunk that
+    // lacks them (e.g. a pure mode change).
+    const { oldPath: bodyOldPath, newPath: bodyNewPath } = parseDiffFilePathLines(lines);
+    const headerPaths = parseDiffGitHeader(lines[0] ?? "");
+    const path = bodyNewPath ?? bodyOldPath ?? headerPaths.newPath ?? headerPaths.oldPath;
+    if (!path) continue;
+
+    let additions = 0;
+    let deletions = 0;
+    for (const line of lines) {
+      if (line.startsWith("+") && !line.startsWith("+++")) additions++;
+      else if (line.startsWith("-") && !line.startsWith("---")) deletions++;
+    }
+
+    files.push({ path, additions, deletions });
+  }
+
+  return files;
+}
+
+/** Whether the named file's patch chunk contains a Git binary marker. */
+export function isBinaryPatchFile(patch: string, filePath: string): boolean {
+  const chunkStarts = [...patch.matchAll(/^diff --git /gm)];
+  for (let i = 0; i < chunkStarts.length; i++) {
+    const start = chunkStarts[i].index ?? 0;
+    const end = chunkStarts[i + 1]?.index ?? patch.length;
+    const chunk = patch.slice(start, end);
+    const lines = chunk.split("\n");
+    const header = parseDiffGitHeader(lines[0] ?? "");
+    const fileLines = parseDiffFilePathLines(lines);
+    const metadata = parseDiffMetadataPathLines(lines);
+    const path =
+      metadata.newPath ??
+      fileLines.newPath ??
+      header.newPath ??
+      metadata.oldPath ??
+      fileLines.oldPath ??
+      header.oldPath;
+    if (path !== filePath) continue;
+    return lines.some(
+      (line) => line === "GIT binary patch" || line.startsWith("Binary files "),
+    );
+  }
+  return false;
 }

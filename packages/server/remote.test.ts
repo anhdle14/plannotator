@@ -5,17 +5,34 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { isRemoteSession, getServerHostname, getServerPort } from "./remote";
+import { closeServer, occupyConsecutivePorts } from "../../tests/helpers/ports";
+import {
+  isAddressInUseError,
+  isRemoteSession,
+  getServerHostname,
+  getServerPort,
+  getServerPorts,
+  startBunServerOnAvailablePort,
+  buildAdvertisedUrl,
+} from "./remote";
 
 // Save and restore env between tests
 const savedEnv: Record<string, string | undefined> = {};
-const envKeys = ["PLANNOTATOR_REMOTE", "PLANNOTATOR_PORT", "SSH_TTY", "SSH_CONNECTION"];
+const envKeys = ["PLANNOTATOR_REMOTE", "PLANNOTATOR_PORT", "SSH_TTY", "SSH_CONNECTION", "PLANNOTATOR_URL_HOST"];
 
 function clearEnv() {
   for (const key of envKeys) {
     savedEnv[key] = process.env[key];
     delete process.env[key];
   }
+}
+
+function startTestBunServer(port: number): ReturnType<typeof Bun.serve> {
+  return Bun.serve({
+    hostname: "127.0.0.1",
+    port,
+    fetch: () => new Response("ok"),
+  });
 }
 
 afterEach(() => {
@@ -85,13 +102,19 @@ describe("isRemoteSession", () => {
   });
 });
 
+describe("isAddressInUseError", () => {
+  test("recognizes Bun errors by code", () => {
+    expect(isAddressInUseError(Object.assign(new Error("listen failed"), { code: "EADDRINUSE" }))).toBe(true);
+  });
+});
+
 describe("getServerPort", () => {
-  test("returns 0 for local session (random port)", () => {
+  test("PLANNOTATOR_PORT unset preserves the random local default", () => {
     clearEnv();
     expect(getServerPort()).toBe(0);
   });
 
-  test("returns 19432 for remote session", () => {
+  test("PLANNOTATOR_PORT unset preserves the 19432 remote default", () => {
     clearEnv();
     process.env.PLANNOTATOR_REMOTE = "1";
     expect(getServerPort()).toBe(19432);
@@ -117,10 +140,49 @@ describe("getServerPort", () => {
     expect(getServerPort()).toBe(3000);
   });
 
+  test("expands an inclusive port range", () => {
+    clearEnv();
+    process.env.PLANNOTATOR_PORT = "19432-19435";
+    expect(getServerPorts()).toEqual([19432, 19433, 19434, 19435]);
+    expect(getServerPort()).toBe(19432);
+  });
+
+  test("ignores reversed port ranges", () => {
+    clearEnv();
+    process.env.PLANNOTATOR_PORT = "19435-19432";
+    expect(getServerPorts()).toEqual([0]);
+  });
+
+  test("ignores ranges containing random port zero", () => {
+    clearEnv();
+    process.env.PLANNOTATOR_PORT = "0-3";
+    expect(getServerPorts()).toEqual([0]);
+  });
+
   test("ignores invalid port (falls back to default)", () => {
     clearEnv();
     process.env.PLANNOTATOR_PORT = "not-a-number";
     expect(getServerPort()).toBe(0);
+  });
+
+  test("rejects malformed fixed ports and ranges without accepting numeric prefixes", () => {
+    clearEnv();
+    for (const value of [
+      "19432garbage",
+      "19432.5",
+      "19432-19435garbage",
+      "19432-19435-19436",
+    ]) {
+      process.env.PLANNOTATOR_PORT = value;
+      expect(getServerPorts()).toEqual([0]);
+    }
+  });
+
+  test("a malformed range follows the existing remote default path", () => {
+    clearEnv();
+    process.env.PLANNOTATOR_REMOTE = "1";
+    process.env.PLANNOTATOR_PORT = "19432-19435garbage";
+    expect(getServerPorts()).toEqual([19432]);
   });
 
   test("ignores out-of-range port", () => {
@@ -136,6 +198,71 @@ describe("getServerPort", () => {
   });
 });
 
+describe("Bun port range binding", () => {
+  test("binds the next port when the range start is occupied", async () => {
+    clearEnv();
+    const { start, servers } = await occupyConsecutivePorts(2);
+    await closeServer(servers[1]);
+    process.env.PLANNOTATOR_PORT = `${start}-${start + 1}`;
+
+    let server: ReturnType<typeof Bun.serve> | undefined;
+    try {
+      server = await startBunServerOnAvailablePort(startTestBunServer);
+      expect(server.port).toBe(start + 1);
+    } finally {
+      server?.stop(true);
+      await closeServer(servers[0]);
+    }
+  });
+
+  test("reports an exhausted occupied range", async () => {
+    clearEnv();
+    const { start, servers } = await occupyConsecutivePorts(2);
+    process.env.PLANNOTATOR_PORT = `${start}-${start + 1}`;
+
+    try {
+      await expect(startBunServerOnAvailablePort(startTestBunServer)).rejects.toThrow(
+        new RegExp(`^Port selection ${start}-${start + 1} exhausted$`),
+      );
+    } finally {
+      await Promise.all(servers.map(closeServer));
+    }
+  });
+
+  test("treats a valid one-port range as range syntax", async () => {
+    clearEnv();
+    const { start, servers } = await occupyConsecutivePorts(1);
+    process.env.PLANNOTATOR_PORT = `${start}-${start}`;
+
+    try {
+      await expect(startBunServerOnAvailablePort(startTestBunServer)).rejects.toThrow(
+        new RegExp(`^Port selection ${start}-${start} exhausted$`),
+      );
+    } finally {
+      await closeServer(servers[0]);
+    }
+  });
+});
+
+describe("Bun non-range port compatibility", () => {
+  test("an occupied fixed port preserves the existing retry error", async () => {
+    clearEnv();
+    const { start, servers } = await occupyConsecutivePorts(1);
+    process.env.PLANNOTATOR_REMOTE = "1";
+    process.env.PLANNOTATOR_PORT = String(start);
+
+    try {
+      await expect(startBunServerOnAvailablePort(startTestBunServer)).rejects.toThrow(
+        new RegExp(
+          `^Port ${start} in use after 5 retries \\(set PLANNOTATOR_PORT to use different port\\)$`,
+        ),
+      );
+    } finally {
+      await closeServer(servers[0]);
+    }
+  });
+});
+
 describe("getServerHostname", () => {
   test("returns loopback for local sessions", () => {
     clearEnv();
@@ -144,6 +271,52 @@ describe("getServerHostname", () => {
 
   test("returns all interfaces for remote sessions", () => {
     clearEnv();
+    process.env.PLANNOTATOR_REMOTE = "1";
+    expect(getServerHostname()).toBe("0.0.0.0");
+  });
+});
+
+describe("buildAdvertisedUrl", () => {
+  test("defaults to localhost", () => {
+    clearEnv();
+    process.env.PLANNOTATOR_REMOTE = "1";
+    // An empty (but set) env var suppresses any urlHost in the developer's
+    // real config.json, isolating the default path.
+    process.env.PLANNOTATOR_URL_HOST = "";
+    expect(buildAdvertisedUrl(19432)).toBe("http://localhost:19432");
+  });
+
+  test("a local session ignores the override and advertises localhost", () => {
+    clearEnv();
+    process.env.PLANNOTATOR_URL_HOST = "my-machine.tailnet.ts.net";
+    expect(buildAdvertisedUrl(1234)).toBe("http://localhost:1234");
+  });
+
+  test("appends the runtime port to the override host", () => {
+    clearEnv();
+    process.env.PLANNOTATOR_REMOTE = "1";
+    process.env.PLANNOTATOR_URL_HOST = "my-machine.tailnet.ts.net";
+    expect(buildAdvertisedUrl(19432)).toBe("http://my-machine.tailnet.ts.net:19432");
+  });
+
+  test("keeps bracketed IPv6 hosts intact", () => {
+    clearEnv();
+    process.env.PLANNOTATOR_REMOTE = "1";
+    process.env.PLANNOTATOR_URL_HOST = "[fd7a::1]";
+    expect(buildAdvertisedUrl(9999)).toBe("http://[fd7a::1]:9999");
+  });
+
+  test("an invalid host falls back to localhost instead of throwing", () => {
+    clearEnv();
+    process.env.PLANNOTATOR_REMOTE = "1";
+    process.env.PLANNOTATOR_URL_HOST = "https://evil.example/path";
+    expect(buildAdvertisedUrl(1234)).toBe("http://localhost:1234");
+  });
+
+  test("the override never affects the bind hostname", () => {
+    clearEnv();
+    process.env.PLANNOTATOR_URL_HOST = "my-machine.tailnet.ts.net";
+    expect(getServerHostname()).toBe("127.0.0.1");
     process.env.PLANNOTATOR_REMOTE = "1";
     expect(getServerHostname()).toBe("0.0.0.0");
   });

@@ -27,6 +27,7 @@ export interface CommentPopoverState {
   selectedText?: string;
   initialText?: string;
   source?: any;
+  draftKey: string;
 }
 
 export interface QuickLabelPickerState {
@@ -45,6 +46,21 @@ type MathAnnotationSource = {
 
 const isMathAnnotationSource = (source: any): source is MathAnnotationSource =>
   source?.kind === 'math';
+
+function commentDraftTargetKey(source: any, selectedText: string): string {
+  if (isMathAnnotationSource(source)) {
+    return `math:${source.blockId}:${source.text}`;
+  }
+  const start = source?.startMeta;
+  const end = source?.endMeta;
+  const startKey = start
+    ? `${start.parentTagName}:${start.parentIndex}:${start.textOffset}`
+    : 'unknown';
+  const endKey = end
+    ? `${end.parentTagName}:${end.parentIndex}:${end.textOffset}`
+    : 'unknown';
+  return `selection:${startKey}:${endKey}:${selectedText}`;
+}
 
 type MathAnnotationTarget = {
   element: HTMLElement;
@@ -174,6 +190,12 @@ const escapeAttrValue = (value: string): string => {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 };
 
+/** Whitespace-insensitive comparison for restore verification: a highlight
+ *  spanning element boundaries legitimately differs from `originalText` in
+ *  whitespace, so only content differences count as a mismatch. */
+const normalizeForRestoreCompare = (value: string): string =>
+  value.replace(/\s+/g, ' ').trim();
+
 const applyMathAnnotationClass = (
   element: HTMLElement,
   id: string,
@@ -227,8 +249,18 @@ export interface UseAnnotationHighlighterOptions {
   selectedAnnotationId: string | null;
   mode: EditorMode;
   enabled?: boolean;
+  /** Opt-in: after a meta-based restore (`fromStore`), verify the painted text
+   *  matches the annotation's `originalText` (whitespace-normalized). On
+   *  mismatch the wrong highlight is removed and the text-search fallback
+   *  runs instead; if that also fails, `onRestoreMismatch` fires and nothing
+   *  is painted. Default false — today's behavior (positions are trusted). */
+  verifyRestoredContent?: boolean;
+  /** Fires when a restore was rejected (content mismatch) and the text-search
+   *  fallback could not re-anchor the annotation either. */
+  onRestoreMismatch?: (annotation: Annotation, restoredText: string) => void;
 }
 
+/** Annotation UI state and mutation commands owned by one rendered document. */
 export interface UseAnnotationHighlighterReturn {
   highlighterRef: RefObject<Highlighter | null>;
 
@@ -244,12 +276,22 @@ export interface UseAnnotationHighlighterReturn {
   handleCommentClose: () => void;
   handleFloatingQuickLabel: (label: QuickLabel) => void;
   handleQuickLabelPickerDismiss: () => void;
+  /** Paint a caller-created DOM range through the same pipeline as pointer selection. */
+  highlightRange: (range: Range, modeOverride?: EditorMode) => void;
+  /** Annotate one rendered formula through the same path as a pointer click. */
+  highlightMathElement: (element: HTMLElement, modeOverride?: EditorMode) => void;
 
   removeHighlight: (id: string) => void;
   clearAllHighlights: () => void;
   applyAnnotations: (annotations: Annotation[]) => void;
 }
 
+/**
+ * Own pointer and caller-supplied range annotations for a Markdown container.
+ *
+ * Highlight restoration failures are reported through `onRestoreMismatch`
+ * when verification is enabled; malformed or stale ranges are ignored.
+ */
 export function useAnnotationHighlighter({
   containerRef,
   annotations,
@@ -258,6 +300,8 @@ export function useAnnotationHighlighter({
   selectedAnnotationId,
   mode,
   enabled = true,
+  verifyRestoredContent = false,
+  onRestoreMismatch,
 }: UseAnnotationHighlighterOptions): UseAnnotationHighlighterReturn {
   const highlighterRef = useRef<Highlighter | null>(null);
   const modeRef = useRef<EditorMode>(mode);
@@ -266,6 +310,7 @@ export function useAnnotationHighlighter({
   const pendingSourceRef = useRef<any>(null);
   const pendingMathTargetsRef = useRef<MathAnnotationTarget[]>([]);
   const pendingMathElementRef = useRef<HTMLElement | null>(null);
+  const pendingModeOverrideRef = useRef<EditorMode | null>(null);
   const justCreatedIdRef = useRef<string | null>(null);
   const lastMousePosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const mouseDownMathRef = useRef<HTMLElement | null>(null);
@@ -278,6 +323,8 @@ export function useAnnotationHighlighter({
   useEffect(() => { modeRef.current = mode; }, [mode]);
   useEffect(() => { onAddAnnotationRef.current = onAddAnnotation; }, [onAddAnnotation]);
   useEffect(() => { onSelectAnnotationRef.current = onSelectAnnotation; }, [onSelectAnnotation]);
+  const onRestoreMismatchRef = useRef(onRestoreMismatch);
+  useEffect(() => { onRestoreMismatchRef.current = onRestoreMismatch; }, [onRestoreMismatch]);
 
   const clearPendingSelection = useCallback(() => {
     pendingSourceRef.current = null;
@@ -625,23 +672,42 @@ export function useAnnotationHighlighter({
         }
       }
 
+      // When a meta-based restore paints text that no longer matches the
+      // anchor's originalText (document drift), remember what it painted so
+      // the mismatch can be reported if the text fallback also fails.
+      let rejectedRestoreText: string | null = null;
+
       if (ann.startMeta && ann.endMeta) {
         try {
           highlighter.fromStore(ann.startMeta, ann.endMeta, ann.originalText, ann.id);
           const restoredDoms = highlighter.getDoms(ann.id);
           if (restoredDoms && restoredDoms.length > 0) {
-            if (ann.type === AnnotationType.DELETION) {
-              highlighter.addClass('deletion', ann.id);
-            } else if (ann.type === AnnotationType.COMMENT) {
-              highlighter.addClass('comment', ann.id);
+            const restoredText = restoredDoms.map(dom => dom.textContent ?? '').join('');
+            if (
+              verifyRestoredContent &&
+              normalizeForRestoreCompare(restoredText) !== normalizeForRestoreCompare(ann.originalText)
+            ) {
+              // Positions resolved, but onto the WRONG text — remove the bad
+              // highlight and fall through to the text-search fallback.
+              try { highlighter.remove(ann.id); } catch {}
+              rejectedRestoreText = restoredText;
+            } else {
+              if (ann.type === AnnotationType.DELETION) {
+                highlighter.addClass('deletion', ann.id);
+              } else if (ann.type === AnnotationType.COMMENT) {
+                highlighter.addClass('comment', ann.id);
+              }
+              return;
             }
-            return;
           }
         } catch {}
       }
 
       const range = findTextInDOM(ann.originalText);
       if (!range) {
+        if (rejectedRestoreText !== null) {
+          onRestoreMismatchRef.current?.(ann, rejectedRestoreText);
+        }
         console.warn(`Could not find text for annotation ${ann.id}: "${ann.originalText.slice(0, 50)}..."`);
         return;
       }
@@ -720,7 +786,7 @@ export function useAnnotationHighlighter({
         console.warn(`Failed to apply highlight for annotation ${ann.id}:`, e);
       }
     });
-  }, [findMathElementsForAnnotation, findTextInDOM]);
+  }, [findMathElementsForAnnotation, findTextInDOM, verifyRestoredContent]);
 
   const removeHighlight = useCallback((id: string) => {
     highlighterRef.current?.remove(id);
@@ -796,18 +862,22 @@ export function useAnnotationHighlighter({
           setCommentPopover(null);
           setQuickLabelPicker(null);
 
-          if (modeRef.current === 'redline') {
+          const effectiveMode = pendingModeOverrideRef.current ?? modeRef.current;
+          pendingModeOverrideRef.current = null;
+
+          if (effectiveMode === 'redline') {
             createAnnotationFromSource(highlighter, source, AnnotationType.DELETION);
             window.getSelection()?.removeAllRanges();
-          } else if (modeRef.current === 'comment') {
+          } else if (effectiveMode === 'comment') {
             pendingSourceRef.current = source;
             setCommentPopover({
               anchorEl: doms[0] as HTMLElement,
               contextText: source.text.slice(0, 80),
               selectedText: source.text,
               source,
+              draftKey: commentDraftTargetKey(source, source.text),
             });
-          } else if (modeRef.current === 'quickLabel') {
+          } else if (effectiveMode === 'quickLabel') {
             pendingSourceRef.current = source;
             setQuickLabelPicker({
               anchorEl: doms[0] as HTMLElement,
@@ -891,6 +961,7 @@ export function useAnnotationHighlighter({
           contextText: source.text.slice(0, 80),
           selectedText: source.text,
           source,
+          draftKey: commentDraftTargetKey(source, source.text),
         });
         return;
       }
@@ -947,6 +1018,87 @@ export function useAnnotationHighlighter({
       highlighter.dispose();
     };
   }, [clearPendingSelection, enabled]);
+
+  const highlightRange = useCallback((range: Range, modeOverride?: EditorMode) => {
+    const highlighter = highlighterRef.current;
+    const container = containerRef.current;
+    if (!highlighter || !container || range.collapsed) return;
+    if (!container.contains(range.commonAncestorContainer)) return;
+
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range.cloneRange());
+    pendingModeOverrideRef.current = modeOverride ?? null;
+
+    try {
+      highlighter.fromRange(range);
+    } finally {
+      pendingModeOverrideRef.current = null;
+      selection?.removeAllRanges();
+    }
+  }, [containerRef]);
+
+  const highlightMathElement = useCallback((
+    element: HTMLElement,
+    modeOverride?: EditorMode,
+  ) => {
+    const container = containerRef.current;
+    const mathElement = closestMathElement(element, container);
+    if (!container || !mathElement) return;
+
+    const effectiveMode = modeOverride ?? modeRef.current;
+    const existingId = mathElement.dataset.bindId;
+    if (existingId && effectiveMode !== 'redline') {
+      onSelectAnnotationRef.current?.(existingId);
+      return;
+    }
+
+    const source = mathSourceFromElement(mathElement);
+    if (!source) return;
+
+    const highlighter = highlighterRef.current;
+    if (pendingSourceRef.current && highlighter && !isMathAnnotationSource(pendingSourceRef.current)) {
+      highlighter.remove(pendingSourceRef.current.id);
+    }
+    clearPendingSelection();
+    setToolbarState(null);
+    setCommentPopover(null);
+    setQuickLabelPicker(null);
+
+    if (effectiveMode === 'redline') {
+      createAnnotationFromMathSource(source, AnnotationType.DELETION);
+      return;
+    }
+
+    pendingSourceRef.current = source;
+    showPendingMathPreview(source);
+
+    if (effectiveMode === 'comment') {
+      setCommentPopover({
+        anchorEl: source.element,
+        contextText: source.text.slice(0, 80),
+        selectedText: source.text,
+        source,
+        draftKey: commentDraftTargetKey(source, source.text),
+      });
+      return;
+    }
+
+    if (effectiveMode === 'quickLabel') {
+      setQuickLabelPicker({
+        anchorEl: source.element,
+        cursorHint: lastMousePosRef.current,
+        source,
+      });
+      return;
+    }
+
+    setToolbarState({
+      element: source.element,
+      source,
+      selectionText: source.text,
+    });
+  }, [clearPendingSelection, containerRef, showPendingMathPreview]);
 
   // Apply CSS classes to existing annotations
   useEffect(() => {
@@ -1071,6 +1223,7 @@ export function useAnnotationHighlighter({
       selectedText: toolbarState.selectionText,
       initialText: initialChar,
       source: toolbarState.source,
+      draftKey: commentDraftTargetKey(toolbarState.source, toolbarState.selectionText),
     });
     setToolbarState(null);
   };
@@ -1163,6 +1316,8 @@ export function useAnnotationHighlighter({
     handleCommentClose,
     handleFloatingQuickLabel,
     handleQuickLabelPickerDismiss,
+    highlightRange,
+    highlightMathElement,
     removeHighlight,
     clearAllHighlights,
     applyAnnotations: applyAnnotationsInternal,

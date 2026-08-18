@@ -1,6 +1,7 @@
 import {
   JJ_TRUNK_REVSET,
   jjLineBaseRevset,
+  parseCommitDiffType,
   parseWorktreeDiffType,
   type DiffType,
 } from "./vcs";
@@ -61,6 +62,7 @@ export function buildWorkspacePromptContextLines(
     "If any repository is marked failed, treat this as a partial workspace review and say so.",
     "For Git child repos, inspect with `git -C <child-repo-folder> ...` from the workspace root.",
     "For JJ child repos, treat the inline diff and prefixed files as authoritative review context.",
+    "For GitButler child repos, treat the inline diff and prefixed files as authoritative; ordinary Git commands can include other applied stacks.",
   ];
 
   if (options.includeReportingInstruction) {
@@ -157,8 +159,11 @@ export function buildAgentReviewUserMessage(
     return `Review ${instruction.target}. ${instruction.inspect} Provide prioritized, actionable findings.`;
   }
 
+  const gitButlerContext = diffType.startsWith("gitbutler:")
+    ? `${contextOnly ? "GitButler changes" : "Review these GitButler changes and provide prioritized findings"}: the inline diff is authoritative. The checked-out workspace may include other stacks or later branch layers, so do not replace this patch with an ordinary \`git diff\`.`
+    : null;
   return [
-    contextOnly ? "Code changes:" : "Review the following code changes and provide prioritized findings.",
+    gitButlerContext ?? (contextOnly ? "Code changes:" : "Review the following code changes and provide prioritized findings."),
     "",
     "```diff",
     patch,
@@ -189,7 +194,27 @@ export function getLocalDiffInstruction(
 ): LocalDiffInstruction | null {
   const effectiveDiffType = normalizeLocalDiffType(diffType);
 
+  // commit:<sha> — a single historical commit, not the working tree.
+  const commitRef = parseCommitDiffType(effectiveDiffType);
+  if (commitRef) {
+    return {
+      target: `the changes introduced by commit ${commitRef.sha.slice(0, 7)}`,
+      // First-parent diff, NOT `git show`: the on-screen patch is
+      // `<sha>^ <sha>`, and for a merge commit `git show`'s combined-diff
+      // presentation renders a different (often empty) changeset — the agent
+      // must inspect exactly what the reviewer is looking at.
+      inspect: `This is a historical commit, not the working tree. Run \`git diff ${commitRef.sha}^ ${commitRef.sha}\` — the commit against its first parent — to inspect exactly the changeset under review (do not use \`git show\`; its merge-commit presentation differs). For a root commit with no parent, use \`git show ${commitRef.sha}\` instead.`,
+    };
+  }
+
   switch (effectiveDiffType) {
+    case "since-base": {
+      const base = defaultBranch || "main";
+      return {
+        target: `all changes since the merge-base with '${base}' — committed, uncommitted, and untracked; the full set a PR would show once it is all committed and pushed`,
+        inspect: `First find the common ancestor with \`git merge-base ${base} HEAD\`, then run \`git diff <merge-base>\` (no right-hand ref — it compares against the working tree) to inspect committed + uncommitted changes. That diff does NOT include untracked files, so also list them with \`git status --porcelain\` (or \`git ls-files --others --exclude-standard\`) and read each new file directly — they are part of this review.`,
+      };
+    }
     case "uncommitted":
       return {
         target: "the current code changes (staged, unstaged, and untracked files)",

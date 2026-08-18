@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Annotation, AnnotationType, Block, type CodeAnnotation, type EditorAnnotation } from '../types';
+import { AnnotationType, type Annotation, type Block, type CodeAnnotation, type EditorAnnotation } from '../types';
 import { isCurrentUser } from '../utils/identity';
 import { ImageThumbnail } from './ImageThumbnail';
 import { EditorAnnotationCard } from './EditorAnnotationCard';
@@ -66,19 +66,34 @@ interface PanelProps {
   editorAnnotations?: EditorAnnotation[];
   onDeleteEditorAnnotation?: (id: string) => void;
   onClose?: () => void;
-  onQuickCopy?: () => Promise<void>;
+  /** Copy the full feedback payload. May resolve a success boolean; resolving
+    *  `false` suppresses the "Copied" flash. A void resolution (existing hosts)
+    *  is treated as success, preserving the original behavior. */
+  onQuickCopy?: () => Promise<void | boolean>;
   onShare?: () => void;
   otherFileAnnotations?: { count: number; files: number };
   onOtherFileAnnotationsClick?: () => void;
   /** Committed direct edits to one or more documents. Rendered as pinned cards
     *  above the annotation timeline with expandable unified diffs. */
   directEdits?: DirectEditsPanelItem[] | null;
+  /** Host slot rendered at the foot of each plan-annotation card (e.g. reply/
+    *  resolve UI). The panel stays presentation-only; clicks inside the slot
+    *  do not select the card. Default: nothing rendered. */
+  renderCardFooter?: (annotation: Annotation) => React.ReactNode;
+  /** Hide every built-in mutation affordance (delete/edit, direct-edit
+    *  discard). The host footer slot still renders: its contents are
+    *  host-owned and may be read affordances (replies, links), so the host
+    *  gates what belongs in it. Selection and scrolling still work.
+    *  Default false — today's behavior. */
+  readOnly?: boolean;
+  /** Embed only the timeline body in a host-owned stage. The host owns the
+    *  title, close control, visible-viewport geometry, and focus boundary. */
+  presentation?: 'panel' | 'embedded';
 }
 
 export const AnnotationPanel: React.FC<PanelProps> = ({
   isOpen,
   annotations,
-  blocks,
   onSelect,
   onDelete,
   onEdit,
@@ -97,8 +112,13 @@ export const AnnotationPanel: React.FC<PanelProps> = ({
   otherFileAnnotations,
   onOtherFileAnnotationsClick,
   directEdits = null,
+  renderCardFooter,
+  readOnly = false,
+  presentation = 'panel',
 }) => {
   const isMobile = useIsMobile();
+  const embedded = presentation === 'embedded';
+  const mobilePanel = isMobile && !embedded;
   const [copiedText, setCopiedText] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
   const sortedAnnotations = [...annotations].sort((a, b) => a.createdA - b.createdA);
@@ -124,53 +144,67 @@ export const AnnotationPanel: React.FC<PanelProps> = ({
     <aside
       data-annotation-panel="true"
       data-plan-sidebar="right"
-      className={`border-l border-border/50 bg-card flex flex-col flex-shrink-0 ${
-        isMobile ? 'fixed top-12 bottom-0 right-0 z-[60] w-full max-w-sm shadow-2xl bg-card' : ''
+      className={`bg-card flex flex-col ${embedded ? 'h-full min-h-0 w-full flex-1' : 'flex-shrink-0 border-l border-border/50'} ${
+        mobilePanel ? 'fixed top-12 bottom-0 right-0 z-[60] w-full max-w-sm shadow-2xl bg-card' : ''
       }`}
-      style={isMobile ? undefined : { width: width ?? 288 }}
+      style={embedded || mobilePanel ? undefined : { width: width ?? 288 }}
     >
       {/* Header */}
-      <div className="border-b border-border/50">
-        <div className="flex h-10 items-center justify-between px-3">
-          <div className="flex items-center gap-2">
-            <h2 className="text-xs font-medium text-foreground">
-              Annotations
-            </h2>
-            {totalCount > 0 && (
-              <span className="flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-primary/10 px-1 font-mono text-[10px] font-medium tabular-nums text-primary">
-                {totalCount}
-              </span>
+      {!embedded && (
+        <div className="border-b border-border/50">
+          <div className="flex h-10 items-center justify-between px-3">
+            <div className="flex items-center gap-2">
+              <h2 className="text-xs font-medium text-foreground">
+                Annotations
+              </h2>
+              {totalCount > 0 && (
+                <span className="flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-primary/10 px-1 font-mono text-[10px] font-medium tabular-nums text-primary">
+                  {totalCount}
+                </span>
+              )}
+            </div>
+            {mobilePanel && onClose && (
+              <button
+                onClick={onClose}
+                className="relative rounded-md p-1.5 text-muted-foreground transition-colors before:absolute before:-inset-1.5 before:content-[''] hover:text-foreground md:hidden"
+                title="Close panel"
+                aria-label="Close panel"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
             )}
           </div>
-          {isMobile && onClose && (
+          {otherFileAnnotations && otherFileAnnotations.count > 0 && (
             <button
-              onClick={onClose}
-              className="relative rounded-md p-1.5 text-muted-foreground transition-colors before:absolute before:-inset-1.5 before:content-[''] hover:text-foreground md:hidden"
-              title="Close panel"
-              aria-label="Close panel"
+              onClick={onOtherFileAnnotationsClick}
+              className="px-3 pb-2 text-[10px] text-primary/70 hover:text-primary transition-colors cursor-pointer"
+              title="Show annotated files in sidebar"
             >
-              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-              </svg>
+              +{otherFileAnnotations.count} in {otherFileAnnotations.files} other file{otherFileAnnotations.files === 1 ? '' : 's'}
             </button>
           )}
         </div>
-        {otherFileAnnotations && otherFileAnnotations.count > 0 && (
-          <button
-            onClick={onOtherFileAnnotationsClick}
-            className="px-3 pb-2 text-[10px] text-primary/70 hover:text-primary transition-colors cursor-pointer"
-            title="Show annotated files in sidebar"
-          >
-            +{otherFileAnnotations.count} in {otherFileAnnotations.files} other file{otherFileAnnotations.files === 1 ? '' : 's'}
-          </button>
-        )}
-      </div>
+      )}
+
+      {embedded && otherFileAnnotations && otherFileAnnotations.count > 0 && (
+        <button
+          type="button"
+          data-pn-touch-target="true"
+          onClick={onOtherFileAnnotationsClick}
+          className="min-h-11 flex-shrink-0 border-b border-border/50 px-3 text-left text-xs text-primary/80 active:bg-muted"
+          title="Show annotated files in navigator"
+        >
+          {otherFileAnnotations.count} more in {otherFileAnnotations.files} other file{otherFileAnnotations.files === 1 ? '' : 's'}
+        </button>
+      )}
 
       {/* List */}
       <OverlayScrollArea className="flex-1 min-h-0">
         <div ref={listRef} className="p-2 flex flex-col gap-1.5">
         {directEdits?.map((item) => (
-          <DirectEditsCard key={item.id} {...item} />
+          <DirectEditsCard key={item.id} {...item} onDiscard={readOnly ? undefined : item.onDiscard} />
         ))}
         {totalCount === 0 ? (
           (!directEdits || directEdits.length === 0) && (
@@ -195,6 +229,8 @@ export const AnnotationPanel: React.FC<PanelProps> = ({
                   onSelect={() => onSelect(entry.annotation.id)}
                   onDelete={() => onDelete(entry.annotation.id)}
                   onEdit={onEdit ? (updates: Partial<Annotation>) => onEdit(entry.annotation.id, updates) : undefined}
+                  readOnly={readOnly}
+                  footer={renderCardFooter?.(entry.annotation)}
                 />
               ) : (
                 <CodeAnnotationCard
@@ -205,6 +241,7 @@ export const AnnotationPanel: React.FC<PanelProps> = ({
                   onSelect={() => onSelectCodeAnnotation?.(entry.annotation.id)}
                   onDelete={() => onDeleteCodeAnnotation?.(entry.annotation.id)}
                   onEdit={onEditCodeAnnotation ? (updates: Partial<CodeAnnotation>) => onEditCodeAnnotation(entry.annotation.id, updates) : undefined}
+                  readOnly={readOnly}
                 />
               )
             ))}
@@ -221,7 +258,7 @@ export const AnnotationPanel: React.FC<PanelProps> = ({
                   <EditorAnnotationCard
                     key={ann.id}
                     annotation={ann}
-                    onDelete={() => onDeleteEditorAnnotation?.(ann.id)}
+                    onDelete={readOnly ? undefined : () => onDeleteEditorAnnotation?.(ann.id)}
                   />
                 ))}
               </>
@@ -238,7 +275,8 @@ export const AnnotationPanel: React.FC<PanelProps> = ({
           {onQuickCopy && (
             <button
               onClick={async () => {
-                await onQuickCopy();
+                const result = await onQuickCopy();
+                if (result === false) return;
                 setCopiedText(true);
                 setTimeout(() => setCopiedText(false), 2000);
               }}
@@ -279,7 +317,7 @@ export const AnnotationPanel: React.FC<PanelProps> = ({
     </aside>
   );
 
-  if (isMobile) {
+  if (mobilePanel) {
     return (
       <>
         <div
@@ -418,7 +456,9 @@ const AnnotationCard: React.FC<{
   onSelect: () => void;
   onDelete: () => void;
   onEdit?: (updates: Partial<Annotation>) => void;
-}> = ({ annotation, isSelected, isMe, onSelect, onDelete, onEdit }) => {
+  readOnly?: boolean;
+  footer?: React.ReactNode;
+}> = ({ annotation, isSelected, isMe, onSelect, onDelete, onEdit, readOnly = false, footer }) => {
   const [isEditing, setIsEditing] = useState(false);
   const [editText, setEditText] = useState(annotation.text || '');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -473,6 +513,7 @@ const AnnotationCard: React.FC<{
   const editComposer = (
     <div onClick={(e: React.MouseEvent) => e.stopPropagation()}>
       <textarea
+        data-pn-mobile-editable="true"
         ref={textareaRef}
         value={editText}
         onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => setEditText(e.target.value)}
@@ -517,26 +558,28 @@ const AnnotationCard: React.FC<{
         <span className="text-[10px] text-muted-foreground/50 truncate">
           {annotation.author ? `${annotation.author}${isMe ? ' (me)' : ''} · ` : ''}{formatTimestamp(annotation.createdA)}
         </span>
-        <div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 [@media(hover:none)]:opacity-100">
-          {onEdit && annotation.type !== AnnotationType.DELETION && !isEditing && (
+        {!readOnly && (
+          <div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 [@media(hover:none)]:opacity-100">
+            {onEdit && annotation.type !== AnnotationType.DELETION && !isEditing && (
+              <button
+                type="button"
+                onClick={handleStartEdit}
+                className="relative rounded-md p-1.5 text-muted-foreground transition-colors before:absolute before:-inset-1.5 before:content-[''] hover:text-foreground"
+                title="Edit annotation"
+              >
+                <PencilIcon />
+              </button>
+            )}
             <button
               type="button"
-              onClick={handleStartEdit}
-              className="relative rounded-md p-1.5 text-muted-foreground transition-colors before:absolute before:-inset-1.5 before:content-[''] hover:text-foreground"
-              title="Edit annotation"
+              onClick={(e: React.MouseEvent<HTMLButtonElement>) => { e.stopPropagation(); onDelete(); }}
+              className="relative rounded-md p-1.5 text-muted-foreground transition-colors before:absolute before:-inset-1.5 before:content-[''] hover:text-destructive"
+              title="Delete annotation"
             >
-              <PencilIcon />
+              <TrashCardIcon />
             </button>
-          )}
-          <button
-            type="button"
-            onClick={(e: React.MouseEvent<HTMLButtonElement>) => { e.stopPropagation(); onDelete(); }}
-            className="relative rounded-md p-1.5 text-muted-foreground transition-colors before:absolute before:-inset-1.5 before:content-[''] hover:text-destructive"
-            title="Delete annotation"
-          >
-            <TrashCardIcon />
-          </button>
-        </div>
+          </div>
+        )}
       </div>
 
       {/* Global Comment - show text directly */}
@@ -585,6 +628,19 @@ const AnnotationCard: React.FC<{
           ))}
         </div>
       )}
+
+      {/* Host footer slot (reply/resolve UI etc.) — interactions inside it
+          must not toggle card selection. */}
+      {footer != null && footer !== false && (
+        <div
+          data-annotation-card-footer="true"
+          className="mt-2"
+          onClick={(e: React.MouseEvent) => e.stopPropagation()}
+          onKeyDown={(e: React.KeyboardEvent) => e.stopPropagation()}
+        >
+          {footer}
+        </div>
+      )}
     </div>
   );
 };
@@ -596,7 +652,8 @@ const CodeAnnotationCard: React.FC<{
   onSelect: () => void;
   onDelete: () => void;
   onEdit?: (updates: Partial<CodeAnnotation>) => void;
-}> = ({ annotation, isSelected, isMe, onSelect, onDelete, onEdit }) => {
+  readOnly?: boolean;
+}> = ({ annotation, isSelected, isMe, onSelect, onDelete, onEdit, readOnly = false }) => {
   const [isEditing, setIsEditing] = useState(false);
   const [editText, setEditText] = useState(annotation.text || '');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -650,26 +707,28 @@ const CodeAnnotationCard: React.FC<{
         <span className="text-[10px] text-muted-foreground/50 truncate">
           {annotation.author ? `${annotation.author}${isMe ? ' (me)' : ''} · ` : ''}{formatTimestamp(annotation.createdAt)}
         </span>
-        <div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 [@media(hover:none)]:opacity-100">
-          {onEdit && !isEditing && (
+        {!readOnly && (
+          <div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 [@media(hover:none)]:opacity-100">
+            {onEdit && !isEditing && (
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); setIsEditing(true); }}
+                className="relative rounded-md p-1.5 text-muted-foreground transition-colors before:absolute before:-inset-1.5 before:content-[''] hover:text-foreground"
+                title="Edit annotation"
+              >
+                <PencilIcon />
+              </button>
+            )}
             <button
               type="button"
-              onClick={(e) => { e.stopPropagation(); setIsEditing(true); }}
-              className="relative rounded-md p-1.5 text-muted-foreground transition-colors before:absolute before:-inset-1.5 before:content-[''] hover:text-foreground"
-              title="Edit annotation"
+              onClick={(e) => { e.stopPropagation(); onDelete(); }}
+              className="relative rounded-md p-1.5 text-muted-foreground transition-colors before:absolute before:-inset-1.5 before:content-[''] hover:text-destructive"
+              title="Delete annotation"
             >
-              <PencilIcon />
+              <TrashCardIcon />
             </button>
-          )}
-          <button
-            type="button"
-            onClick={(e) => { e.stopPropagation(); onDelete(); }}
-            className="relative rounded-md p-1.5 text-muted-foreground transition-colors before:absolute before:-inset-1.5 before:content-[''] hover:text-destructive"
-            title="Delete annotation"
-          >
-            <TrashCardIcon />
-          </button>
-        </div>
+          </div>
+        )}
       </div>
 
       {/* File / line meta */}
@@ -686,6 +745,7 @@ const CodeAnnotationCard: React.FC<{
       {isEditing ? (
         <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
           <textarea
+            data-pn-mobile-editable="true"
             ref={textareaRef}
             value={editText}
             onChange={(e) => setEditText(e.target.value)}

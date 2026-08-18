@@ -1,5 +1,5 @@
 import React from "react";
-import { Block } from "../types";
+import type { Block } from "../types";
 import { InlineMarkdown } from "./InlineMarkdown";
 import { ListItemBody } from "./ListItemBody";
 import { CodeBlock } from "./blocks/CodeBlock";
@@ -106,7 +106,7 @@ export const BlockRenderer: React.FC<{
     }
 
     case 'code':
-      return <CodeBlock block={block} onHover={() => {}} onLeave={() => {}} isHovered={false} />;
+      return <CodeBlock block={block} isHovered={false} />;
 
     case 'table':
       return (

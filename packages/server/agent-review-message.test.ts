@@ -11,6 +11,9 @@ describe("buildAgentReviewUserMessage", () => {
       ["staged", "git diff --staged"],
       ["unstaged", "unstaged code changes"],
       ["last-commit", "git diff HEAD~1..HEAD"],
+      // First-parent diff, never `git show` — a merge commit's `git show`
+      // combined-diff presentation differs from the on-screen patch.
+      ["commit:abc1234def5678", "git diff abc1234def5678^ abc1234def5678"],
       ["branch", "git diff origin/main..HEAD"],
       ["merge-base", "git merge-base origin/main HEAD"],
       ["all", "All files are shown as additions"],
@@ -67,6 +70,19 @@ describe("buildAgentReviewUserMessage", () => {
     expect(message).toContain(patch);
   });
 
+  test("treats the inline GitButler patch as authoritative", () => {
+    const message = buildAgentReviewUserMessage(
+      patch,
+      "gitbutler:branch:feature%2Fapi",
+      { defaultBranch: "abc123" },
+    );
+
+    expect(message).toContain("Review these GitButler changes and provide prioritized findings");
+    expect(message).toContain("the inline diff is authoritative");
+    expect(message).toContain("other stacks or later branch layers");
+    expect(message).toContain(patch);
+  });
+
   test("builds workspace review instructions with prefixed paths and inline patch", () => {
     const message = buildAgentReviewUserMessageForTarget({
       kind: "workspace",
@@ -76,6 +92,7 @@ describe("buildAgentReviewUserMessage", () => {
         repos: [
           { label: "api", cwd: "/tmp/workspace/api", changed: true, vcsType: "git", gitRef: "Uncommitted changes" },
           { label: "web", cwd: "/tmp/workspace/web", changed: true, vcsType: "jj", gitRef: "Uncommitted changes" },
+          { label: "app", cwd: "/tmp/workspace/app", changed: true, vcsType: "gitbutler", gitRef: "GitButler workspace" },
         ],
       },
     });
@@ -91,6 +108,8 @@ describe("buildAgentReviewUserMessage", () => {
     expect(message).toContain("- web/ [jj, changed] -> /tmp/workspace/web");
     expect(message).toContain("git -C <child-repo-folder>");
     expect(message).toContain("JJ child repos");
+    expect(message).toContain("GitButler child repos");
+    expect(message).toContain("- app/ [gitbutler, changed] -> /tmp/workspace/app");
     expect(message).toContain(patch);
   });
 
@@ -267,6 +286,16 @@ describe("getLocalDiffInstruction", () => {
 });
 
 describe("buildClaudeCommand", () => {
+  test("defaults to Opus 5 when the caller passes no model", () => {
+    const command = buildClaudeCommand("review").command;
+    expect(command[command.indexOf("--model") + 1]).toBe("claude-opus-5");
+  });
+
+  test("still honours an explicitly requested model", () => {
+    const command = buildClaudeCommand("review", "claude-sonnet-5").command;
+    expect(command[command.indexOf("--model") + 1]).toBe("claude-sonnet-5");
+  });
+
   test("allows read-only JJ commands", () => {
     const command = buildClaudeCommand("review").command;
     const allowedTools = command[command.indexOf("--allowedTools") + 1];

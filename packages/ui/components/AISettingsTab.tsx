@@ -2,14 +2,13 @@ import type React from 'react';
 import { getProviderMeta } from './ProviderIcons';
 import {
   getAIProviderSettings,
-  resolveAIModelForProvider,
   resolveAIProviderSelection,
   saveAIProviderSelection,
   savePreferredModel,
   type AIProviderOption,
 } from '../utils/aiProvider';
 import { useState } from 'react';
-import type { Origin } from '@plannotator/shared/agents';
+import type { Origin } from '@plannotator/core/agents';
 
 interface AIProvider extends AIProviderOption {
   capabilities: Record<string, boolean>;
@@ -37,9 +36,11 @@ export const AISettingsTab: React.FC<AISettingsTabProps> = ({
 
   const handleSelectProvider = (providerId: string) => {
     onProviderChange(providerId);
-    const provider = providers.find(p => p.id === providerId) ?? null;
-    const model = resolveAIModelForProvider(provider, getAIProviderSettings().preferredModels);
-    saveAIProviderSelection({ providerId, model, origin });
+    // Persist only the provider choice. Writing the resolved model here would
+    // clobber a saved preference the currently-advertised model list doesn't
+    // include (e.g. before deferred Codex discovery has run) with the static
+    // fallback id — the saved model only changes when the user picks one.
+    saveAIProviderSelection({ providerId, model: null, origin });
   };
 
   const handleModelChange = (providerId: string, modelId: string) => {

@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React from 'react';
 import {
   ActionMenu,
   ActionMenuDivider,
@@ -6,21 +6,48 @@ import {
   ActionMenuSectionLabel,
 } from '@plannotator/ui/components/ActionMenu';
 import { useTheme } from '@plannotator/ui/components/ThemeProvider';
+import { THEME_MODES } from '@plannotator/ui/components/themeModes';
 import { MenuVersionSection } from '@plannotator/ui/components/MenuVersionSection';
 import { ReviewAgentsIcon } from '@plannotator/ui/components/ReviewAgentsIcon';
 import { TextShimmer } from '@plannotator/ui/components/TextShimmer';
+import { SparklesIcon } from '@plannotator/ui/components/SparklesIcon';
+import { GitHubIcon } from '@plannotator/ui/components/GitHubIcon';
+import { GitLabIcon } from '@plannotator/ui/components/GitLabIcon';
 import { modKey } from '@plannotator/ui/utils/platform';
 import type { UpdateInfo } from '@plannotator/ui/hooks/useUpdateCheck';
 import type { Origin } from '@plannotator/shared/agents';
 
+export interface CompactReviewDestination {
+  value: 'agent' | 'platform';
+  platform: 'github' | 'gitlab';
+  platformLabel: string;
+  onChange: (value: 'agent' | 'platform') => void;
+}
+
+export interface CompactReviewAction {
+  id: 'exit' | 'feedback' | 'approve' | 'copy';
+  label: string;
+  subtitle?: string;
+  onSelect: () => void;
+  disabled?: boolean;
+}
+
 interface ReviewHeaderMenuProps {
   onOpenSettings: () => void;
+  onOpenReviewSetup?: () => void;
   onOpenExport: () => void;
   onCopyAgentInstructions: () => void;
   onToggleFileTree: () => void;
   onToggleSidebar: () => void;
+  onOpenGuide?: () => void;
+  onOpenAnnotations?: () => void;
+  onOpenAI?: () => void;
+  onOpenAgents?: () => void;
+  compactDestination?: CompactReviewDestination;
+  compactActions?: CompactReviewAction[];
   isFileTreeOpen: boolean;
   isSidebarOpen: boolean;
+  compactTouchLayout?: boolean;
   agentInstructionsEnabled: boolean;
   appVersion: string;
   updateInfo?: UpdateInfo | null;
@@ -30,34 +57,46 @@ interface ReviewHeaderMenuProps {
 
 export const ReviewHeaderMenu: React.FC<ReviewHeaderMenuProps> = ({
   onOpenSettings,
+  onOpenReviewSetup,
   onOpenExport,
   onCopyAgentInstructions,
   onToggleFileTree,
   onToggleSidebar,
+  onOpenGuide,
+  onOpenAnnotations,
+  onOpenAI,
+  onOpenAgents,
+  compactDestination,
+  compactActions = [],
   isFileTreeOpen,
   isSidebarOpen,
+  compactTouchLayout = false,
   agentInstructionsEnabled,
   appVersion,
   updateInfo,
   origin,
   isWSL = false,
 }) => {
-  const { theme, resolvedMode, setTheme } = useTheme();
-  const activeTheme = useMemo<'light' | 'dark'>(() => {
-    return theme === 'system' ? resolvedMode : theme;
-  }, [resolvedMode, theme]);
+  const { theme, setTheme } = useTheme();
 
   const showUpdateDot = !!updateInfo?.updateAvailable && !updateInfo.dismissed;
 
   return (
     <ActionMenu
+      panelWidth="wide"
+      panelClassName={compactTouchLayout
+        ? 'absolute top-full right-0 mt-1 w-[min(18rem,calc(100vw-1rem))] max-h-[calc(var(--pn-viewport-height,100vh)-4.5rem-var(--pn-safe-top)-var(--pn-safe-bottom))] overflow-y-auto rounded-lg border border-border bg-popover py-1 shadow-xl z-[70]'
+        : undefined
+      }
       renderTrigger={({ isOpen, toggleMenu }) => (
         <button
+          data-pn-touch-target
+          data-pn-touch-target-icon
           onClick={() => {
             if (!isOpen && showUpdateDot) updateInfo?.dismiss();
             toggleMenu();
           }}
-          className={`relative flex items-center gap-1.5 p-1.5 md:px-2.5 md:py-1 rounded-md text-xs font-medium transition-colors ${
+          className={`relative flex h-7 items-center gap-1.5 px-1.5 lg:px-2.5 rounded-md text-xs font-medium transition-colors ${
             isOpen
               ? 'bg-muted text-foreground'
               : 'text-muted-foreground hover:text-foreground hover:bg-muted'
@@ -68,38 +107,91 @@ export const ReviewHeaderMenu: React.FC<ReviewHeaderMenuProps> = ({
         >
           {isOpen ? <CloseIcon /> : <MenuIcon />}
           {showUpdateDot ? (
-            <TextShimmer className="hidden md:inline text-xs font-medium" duration={2.5} spread={1.5}>
+            <TextShimmer className="hidden lg:inline text-xs font-medium" duration={2.5} spread={1.5}>
               Options
             </TextShimmer>
           ) : (
-            <span className="hidden md:inline">Options</span>
+            <span className="hidden lg:inline">Options</span>
           )}
           {showUpdateDot && (
-            <span className="absolute top-0.5 right-0.5 md:-top-0.5 md:-right-0.5 w-2 h-2 rounded-full bg-primary ring-2 ring-background" />
+            <span className="absolute top-0.5 right-0.5 lg:-top-0.5 lg:-right-0.5 w-2 h-2 rounded-full bg-primary ring-2 ring-background" />
           )}
         </button>
       )}
     >
       {({ closeMenu }) => (
         <>
+          {compactTouchLayout && (compactDestination || compactActions.length > 0) && (
+            <>
+              <div className="px-3 py-2 space-y-2">
+                <ActionMenuSectionLabel>Review</ActionMenuSectionLabel>
+                {compactDestination && (
+                  <div className="grid grid-cols-2 gap-1 rounded-lg bg-muted/50 p-0.5" aria-label="Review destination">
+                    {(['agent', 'platform'] as const).map((destination) => {
+                      const selected = compactDestination.value === destination;
+                      const label = destination === 'agent' ? 'Agent' : compactDestination.platformLabel;
+                      return (
+                        <button
+                          data-pn-touch-target
+                          type="button"
+                          key={destination}
+                          aria-pressed={selected}
+                          onClick={() => compactDestination.onChange(destination)}
+                          className={`flex min-w-0 items-center justify-center gap-1.5 rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
+                            selected
+                              ? 'bg-background text-foreground shadow-sm'
+                              : 'text-muted-foreground hover:text-foreground'
+                          }`}
+                        >
+                          {destination === 'platform'
+                            ? compactDestination.platform === 'gitlab'
+                              ? <GitLabIcon className="w-3.5 h-3.5" />
+                              : <GitHubIcon className="w-3.5 h-3.5" />
+                            : <AgentDestinationIcon />
+                          }
+                          <span className="truncate">{label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+              {compactActions.map((action) => (
+                <ActionMenuItem
+                  key={action.id}
+                  onClick={() => {
+                    closeMenu();
+                    action.onSelect();
+                  }}
+                  disabled={action.disabled}
+                  icon={<CompactReviewActionIcon kind={action.id} />}
+                  label={action.label}
+                  subtitle={action.subtitle}
+                />
+              ))}
+              <ActionMenuDivider />
+            </>
+          )}
+
           <div className="px-3 py-2 space-y-1.5">
             <ActionMenuSectionLabel>Theme</ActionMenuSectionLabel>
             <div className="flex items-center gap-1 rounded-lg bg-muted/50 p-0.5">
-              {(['light', 'dark'] as const).map((mode) => (
+              {THEME_MODES.map(({ id, label, Icon }) => (
                 <button
-                  key={mode}
+                  data-pn-touch-target={compactTouchLayout || undefined}
+                  key={id}
                   onClick={() => {
                     closeMenu();
-                    setTheme(mode);
+                    setTheme(id);
                   }}
                   className={`flex flex-1 items-center justify-center gap-1.5 rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
-                    activeTheme === mode
+                    theme === id
                       ? 'bg-background text-foreground shadow-sm'
                       : 'text-muted-foreground hover:text-foreground'
                   }`}
                 >
-                  {mode === 'light' ? <SunIcon /> : <MoonIcon />}
-                  <span className="capitalize">{mode}</span>
+                  <Icon />
+                  <span>{label}</span>
                 </button>
               ))}
             </div>
@@ -115,6 +207,20 @@ export const ReviewHeaderMenu: React.FC<ReviewHeaderMenuProps> = ({
             icon={<SettingsIcon />}
             label="Settings"
           />
+          {onOpenReviewSetup && (
+            <ActionMenuItem
+              onClick={() => {
+                closeMenu();
+                onOpenReviewSetup();
+              }}
+              icon={(
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 5h16M4 10h16M4 15h16M4 20h10" />
+                </svg>
+              )}
+              label="Set up review view"
+            />
+          )}
           <ActionMenuItem
             onClick={() => {
               closeMenu();
@@ -135,6 +241,52 @@ export const ReviewHeaderMenu: React.FC<ReviewHeaderMenuProps> = ({
             />
           )}
 
+          {(onOpenGuide || onOpenAnnotations || onOpenAI || onOpenAgents) && (
+            <>
+              <ActionMenuDivider />
+              {onOpenGuide && (
+                <ActionMenuItem
+                  onClick={() => {
+                    closeMenu();
+                    onOpenGuide();
+                  }}
+                  icon={<GuideIcon />}
+                  label="Guided Review"
+                />
+              )}
+              {onOpenAnnotations && (
+                <ActionMenuItem
+                  onClick={() => {
+                    closeMenu();
+                    onOpenAnnotations();
+                  }}
+                  icon={<SidebarIcon />}
+                  label="Annotations"
+                />
+              )}
+              {onOpenAI && (
+                <ActionMenuItem
+                  onClick={() => {
+                    closeMenu();
+                    onOpenAI();
+                  }}
+                  icon={<SparklesIcon className="w-3.5 h-3.5" />}
+                  label="AI Chat"
+                />
+              )}
+              {onOpenAgents && (
+                <ActionMenuItem
+                  onClick={() => {
+                    closeMenu();
+                    onOpenAgents();
+                  }}
+                  icon={<ReviewAgentsIcon className="w-3.5 h-3.5" />}
+                  label="Review Agents"
+                />
+              )}
+            </>
+          )}
+
           <ActionMenuDivider />
 
           <ActionMenuItem
@@ -143,18 +295,23 @@ export const ReviewHeaderMenu: React.FC<ReviewHeaderMenuProps> = ({
               onToggleFileTree();
             }}
             icon={<FileTreeMenuIcon />}
-            label={isFileTreeOpen ? 'Hide File Tree' : 'Show File Tree'}
-            badge={<KbdHint keys={[modKey, 'B']} />}
+            label={compactTouchLayout
+              ? (isFileTreeOpen ? 'Close review navigation' : 'Open review navigation')
+              : (isFileTreeOpen ? 'Hide File Tree' : 'Show File Tree')
+            }
+            badge={compactTouchLayout ? undefined : <KbdHint keys={[modKey, 'B']} />}
           />
-          <ActionMenuItem
-            onClick={() => {
-              closeMenu();
-              onToggleSidebar();
-            }}
-            icon={<SidebarIcon />}
-            label={isSidebarOpen ? 'Hide Sidebar' : 'Show Sidebar'}
-            badge={<KbdHint keys={[modKey, '.']} />}
-          />
+          {!compactTouchLayout && (
+            <ActionMenuItem
+              onClick={() => {
+                closeMenu();
+                onToggleSidebar();
+              }}
+              icon={<SidebarIcon />}
+              label={isSidebarOpen ? 'Hide Sidebar' : 'Show Sidebar'}
+              badge={<KbdHint keys={[modKey, '.']} />}
+            />
+          )}
 
           <ActionMenuDivider />
 
@@ -197,19 +354,6 @@ const ExportIcon = () => (
   </svg>
 );
 
-const SunIcon = () => (
-  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-    <path strokeLinecap="round" strokeLinejoin="round" d="M12 3v2.25M12 18.75V21M3 12h2.25M18.75 12H21M5.636 5.636l1.591 1.591M16.773 16.773l1.591 1.591M5.636 18.364l1.591-1.591M16.773 7.227l1.591-1.591" />
-    <circle cx="12" cy="12" r="3.25" />
-  </svg>
-);
-
-const MoonIcon = () => (
-  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-    <path strokeLinecap="round" strokeLinejoin="round" d="M21 12.79A9 9 0 1111.21 3c-.18.57-.21 1.19-.21 1.82A8 8 0 0019.18 13c.63 0 1.25-.03 1.82-.21z" />
-  </svg>
-);
-
 const FileTreeMenuIcon = () => (
   <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
     <path strokeLinecap="round" strokeLinejoin="round" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
@@ -231,3 +375,34 @@ const SidebarIcon = () => (
     <path strokeLinecap="round" strokeLinejoin="round" d="M9 4h10a2 2 0 012 2v12a2 2 0 01-2 2H9M9 4H5a2 2 0 00-2 2v12a2 2 0 002 2h4M9 4v16" />
   </svg>
 );
+
+const GuideIcon = () => (
+  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+    <path strokeLinecap="round" strokeLinejoin="round" d="M8 6h8M8 10h8M8 14h5M5 3h14a2 2 0 012 2v14a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2z" />
+  </svg>
+);
+
+const AgentDestinationIcon = () => (
+  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+    <path strokeLinecap="round" strokeLinejoin="round" d="M8 9h8m-8 4h5m-7 7 3-3h8a3 3 0 003-3V7a3 3 0 00-3-3H5a3 3 0 00-3 3v7a3 3 0 003 3h1v3z" />
+  </svg>
+);
+
+const CompactReviewActionIcon: React.FC<{ kind: CompactReviewAction['id'] }> = ({ kind }) => {
+  if (kind === 'approve') {
+    return (
+      <svg className="w-3.5 h-3.5 text-success" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+      </svg>
+    );
+  }
+  if (kind === 'feedback') {
+    return (
+      <svg className="w-3.5 h-3.5 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-4l-4 4v-4z" />
+      </svg>
+    );
+  }
+  if (kind === 'copy') return <ExportIcon />;
+  return <CloseIcon />;
+};

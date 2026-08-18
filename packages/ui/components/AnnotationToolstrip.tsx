@@ -210,8 +210,8 @@ export const AnnotationToolstrip: React.FC<AnnotationToolstripProps> = ({
                 width="100%"
                 height="100%"
                 src={helpTab === 'selection'
-                  ? 'https://www.youtube.com/embed/ZNt9jtfx9TY?autoplay=1'
-                  : 'https://www.youtube.com/embed/a_AT7cEN_9I?autoplay=1'
+                  ? 'https://www.youtube-nocookie.com/embed/ZNt9jtfx9TY?autoplay=1'
+                  : 'https://www.youtube-nocookie.com/embed/a_AT7cEN_9I?autoplay=1'
                 }
                 title={helpTab === 'selection' ? 'How Selection Modes Work' : 'How Plannotator Works'}
                 frameBorder="0"

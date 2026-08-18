@@ -2,32 +2,29 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 
-export type PhaseName = "planning" | "executing" | "reviewing";
+export type PhaseName = "planning" | "grilling" | "executing" | "reviewing";
 export type RuntimePhase = PhaseName | "idle";
-
-export interface PhaseModelRef {
-  provider: string;
-  id: string;
-}
+export type ExecutionMode = "automatic" | "external";
 
 /**
  * Config values loaded from JSON can intentionally clear inherited values.
  *
  * - `null` clears a value from a parent config.
- * - `[]` clears active tools.
  * - `""` clears string values.
  */
 export interface PhaseProfile {
-  model?: PhaseModelRef | null;
-  thinking?: ThinkingLevel | null;
-  activeTools?: string[] | null;
   statusLabel?: string | null;
-  systemPrompt?: string | null;
+  /**
+   * Phase framing template, delivered ONCE as a conversation message when the
+   * phase is entered. Plannotator never modifies Pi's system prompt (#922);
+   * the obsolete `systemPrompt` config key is ignored with a warning.
+   */
+  instructions?: string | null;
 }
 
 export interface PlannotatorConfig {
+  executionMode?: ExecutionMode | null;
   defaults?: PhaseProfile | null;
   phases?: Partial<Record<PhaseName, PhaseProfile | null>>;
 }
@@ -37,12 +34,14 @@ export interface LoadedPlannotatorConfig {
   warnings: string[];
 }
 
+export interface LoadPlannotatorConfigOptions {
+  /** Whether Pi approved project-local inputs for this working directory. */
+  projectTrusted: boolean;
+}
+
 export interface ResolvedPhaseProfile {
-  model?: PhaseModelRef;
-  thinking?: ThinkingLevel;
-  activeTools?: string[];
   statusLabel?: string;
-  systemPrompt?: string;
+  instructions?: string;
 }
 
 export interface PromptVariables {
@@ -60,8 +59,7 @@ export interface PromptRenderResult {
 }
 
 const INTERNAL_CONFIG_PATH = join(dirname(fileURLToPath(import.meta.url)), "plannotator.json");
-const PHASES: PhaseName[] = ["planning", "executing", "reviewing"];
-const THINKING_LEVELS = new Set<string>(["minimal", "low", "medium", "high", "xhigh"]);
+const PHASES: PhaseName[] = ["planning", "grilling", "executing", "reviewing"];
 
 function getAgentConfigDir(): string {
   const envDir = process.env.PI_CODING_AGENT_DIR;
@@ -83,34 +81,6 @@ function readJsonFile(path: string): { data?: unknown; error?: string } {
   }
 }
 
-function normalizeModel(value: unknown): PhaseModelRef | null | undefined {
-  if (value === null) return null;
-  if (!isRecord(value)) return undefined;
-
-  const provider = typeof value.provider === "string" ? value.provider.trim() : "";
-  const id = typeof value.id === "string" ? value.id.trim() : "";
-  if (!provider || !id) return undefined;
-  return { provider, id };
-}
-
-function normalizeThinking(value: unknown): ThinkingLevel | null | undefined {
-  if (value === null) return null;
-  if (typeof value !== "string") return undefined;
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-
-  return THINKING_LEVELS.has(trimmed as ThinkingLevel) ? (trimmed as ThinkingLevel) : undefined;
-}
-
-function normalizeTools(value: unknown): string[] | null | undefined {
-  if (value === null) return null;
-  if (!Array.isArray(value)) return undefined;
-  if (value.length === 0) return [];
-
-  const tools = value.filter((tool): tool is string => typeof tool === "string" && tool.trim().length > 0);
-  return tools.length > 0 ? tools : undefined;
-}
-
 function normalizeLabel(value: unknown): string | null | undefined {
   if (value === null) return null;
   if (typeof value !== "string") return undefined;
@@ -130,19 +100,15 @@ function normalizeProfile(raw: unknown): PhaseProfile | null | undefined {
 
   const profile: PhaseProfile = {};
 
-  if ("model" in raw) profile.model = normalizeModel(raw.model);
-  if ("thinking" in raw) profile.thinking = normalizeThinking(raw.thinking);
-  if ("thinkingLevel" in raw && profile.thinking === undefined) profile.thinking = normalizeThinking(raw.thinkingLevel);
-  if ("activeTools" in raw) profile.activeTools = normalizeTools(raw.activeTools);
   if ("statusLabel" in raw) profile.statusLabel = normalizeLabel(raw.statusLabel);
-  if ("systemPrompt" in raw) profile.systemPrompt = normalizePrompt(raw.systemPrompt);
+  if ("instructions" in raw) profile.instructions = normalizePrompt(raw.instructions);
 
   return profile;
 }
 
 function cloneProfile(profile: PhaseProfile | null | undefined): PhaseProfile | null | undefined {
   if (profile === null || profile === undefined) return profile;
-  return { ...profile, activeTools: profile.activeTools ? [...profile.activeTools] : profile.activeTools };
+  return { ...profile };
 }
 
 function mergeProfile(base: PhaseProfile | null | undefined, override: PhaseProfile | null | undefined): PhaseProfile | null | undefined {
@@ -151,11 +117,8 @@ function mergeProfile(base: PhaseProfile | null | undefined, override: PhaseProf
   if (base === null || base === undefined) return cloneProfile(override);
 
   const merged: PhaseProfile = {
-    model: override.model !== undefined ? override.model : base.model,
-    thinking: override.thinking !== undefined ? override.thinking : base.thinking,
-    activeTools: override.activeTools !== undefined ? override.activeTools : base.activeTools,
     statusLabel: override.statusLabel !== undefined ? override.statusLabel : base.statusLabel,
-    systemPrompt: override.systemPrompt !== undefined ? override.systemPrompt : base.systemPrompt,
+    instructions: override.instructions !== undefined ? override.instructions : base.instructions,
   };
 
   return merged;
@@ -169,21 +132,32 @@ function mergeConfig(base: PlannotatorConfig, override: PlannotatorConfig): Plan
   }
 
   return {
+    executionMode: override.executionMode !== undefined ? override.executionMode : base.executionMode,
     defaults: mergeProfile(base.defaults, override.defaults),
     phases: Object.keys(phases).length > 0 ? phases : undefined,
   };
 }
 
-function loadConfigSource(path: string): { config: PlannotatorConfig; warning?: string } {
+function loadConfigSource(path: string): { config: PlannotatorConfig; warnings: string[] } {
   const parsed = readJsonFile(path);
   if (parsed.error) {
-    return { config: {}, warning: parsed.error };
+    return { config: {}, warnings: [parsed.error] };
   }
 
   const raw = parsed.data;
-  if (!isRecord(raw)) return { config: {} };
+  if (!isRecord(raw)) return { config: {}, warnings: [] };
 
+  const warnings: string[] = [];
   const config: PlannotatorConfig = {};
+  if (raw.executionMode === null || raw.executionMode === "automatic" || raw.executionMode === "external") {
+    config.executionMode = raw.executionMode;
+  } else if (raw.executionMode !== undefined) {
+    // Unrecognized values fall through to the inherited value (ultimately
+    // "automatic"), so say so instead of silently ignoring the key.
+    warnings.push(
+      `Ignoring unknown executionMode ${JSON.stringify(raw.executionMode)} in ${path}: expected "automatic" or "external". Falling back to automatic.`,
+    );
+  }
   if ("defaults" in raw) config.defaults = normalizeProfile(raw.defaults);
 
   if ("phases" in raw && isRecord(raw.phases)) {
@@ -195,25 +169,80 @@ function loadConfigSource(path: string): { config: PlannotatorConfig; warning?: 
     if (Object.keys(phases).length > 0) config.phases = phases;
   }
 
-  return { config };
+  // Plannotator no longer modifies Pi's system prompt (#922). The old
+  // systemPrompt key is ignored; say so once instead of silently dropping it.
+  const obsoleteScopes: string[] = [];
+  if (isRecord(raw.defaults) && "systemPrompt" in raw.defaults) obsoleteScopes.push("defaults");
+  if (isRecord(raw.phases)) {
+    for (const phase of PHASES) {
+      const phaseRaw = raw.phases[phase];
+      if (isRecord(phaseRaw) && "systemPrompt" in phaseRaw) obsoleteScopes.push(`phases.${phase}`);
+    }
+  }
+  if (obsoleteScopes.length > 0) {
+    warnings.push(
+      `Ignoring obsolete "systemPrompt" under ${obsoleteScopes.join(", ")} in ${path}: Plannotator no longer modifies the system prompt. Rename the key to "instructions" to deliver the text as a phase-entry message instead.`,
+    );
+  }
+
+  const runtimeControlScopes: string[] = [];
+  const runtimeKeys = ["model", "thinking", "thinkingLevel", "activeTools"];
+  const rawDefaults = raw.defaults;
+  if (isRecord(rawDefaults) && runtimeKeys.some((key) => key in rawDefaults)) {
+    runtimeControlScopes.push("defaults");
+  }
+  if (isRecord(raw.phases)) {
+    for (const phase of PHASES) {
+      const phaseRaw = raw.phases[phase];
+      if (isRecord(phaseRaw) && runtimeKeys.some((key) => key in phaseRaw)) {
+        runtimeControlScopes.push(`phases.${phase}`);
+      }
+    }
+  }
+  if (runtimeControlScopes.length > 0) {
+    warnings.push(
+      `Ignoring model, thinking, and activeTools under ${runtimeControlScopes.join(", ")} in ${path}: the Pi-native fork preserves Pi runtime state.`,
+    );
+  }
+
+  return { config, warnings };
 }
 
-export function loadPlannotatorConfig(cwd: string): LoadedPlannotatorConfig {
+export function loadPlannotatorConfig(
+  cwd: string,
+  options: LoadPlannotatorConfigOptions,
+): LoadedPlannotatorConfig {
   const warnings: string[] = [];
 
+  // The bundled config carries the planning rules and phase instructions. A
+  // packaging regression that drops it would otherwise silently produce a
+  // rule-less planning phase, so its absence is worth a warning (user global
+  // and project configs stay optional and silent).
+  if (!existsSync(INTERNAL_CONFIG_PATH)) {
+    warnings.push(
+      `Built-in config missing at ${INTERNAL_CONFIG_PATH}: phase instructions and planning tools will not apply. Reinstall the extension.`,
+    );
+  }
+
   const internal = loadConfigSource(INTERNAL_CONFIG_PATH);
-  if (internal.warning) warnings.push(internal.warning);
+  warnings.push(...internal.warnings);
 
   const globalPath = join(getAgentConfigDir(), "plannotator.json");
   const globalConfig = loadConfigSource(globalPath);
-  if (globalConfig.warning) warnings.push(globalConfig.warning);
+  warnings.push(...globalConfig.warnings);
 
   const projectPath = join(cwd, ".pi", "plannotator.json");
-  const projectConfig = loadConfigSource(projectPath);
-  if (projectConfig.warning) warnings.push(projectConfig.warning);
+  const projectConfig = options.projectTrusted
+    ? loadConfigSource(projectPath)
+    : { config: {}, warnings: [] };
+  warnings.push(...projectConfig.warnings);
 
   const merged = mergeConfig(mergeConfig(internal.config, globalConfig.config), projectConfig.config);
   return { config: merged, warnings };
+}
+
+export function resolveExecutionMode(config: PlannotatorConfig): ExecutionMode {
+  return config.executionMode ?? "automatic";
 }
 
 export function resolvePhaseProfile(config: PlannotatorConfig, phase: PhaseName): ResolvedPhaseProfile {
@@ -221,35 +250,9 @@ export function resolvePhaseProfile(config: PlannotatorConfig, phase: PhaseName)
   const phaseConfig = config.phases?.[phase] ?? {};
 
   return {
-    model: resolveModel(defaults.model, phaseConfig.model),
-    thinking: resolveThinking(defaults.thinking, phaseConfig.thinking),
-    activeTools: resolveTools(defaults.activeTools, phaseConfig.activeTools),
     statusLabel: resolveString(defaults.statusLabel, phaseConfig.statusLabel),
-    systemPrompt: resolveString(defaults.systemPrompt, phaseConfig.systemPrompt),
+    instructions: resolveString(defaults.instructions, phaseConfig.instructions),
   };
-}
-
-function resolveModel(base: PhaseModelRef | null | undefined, override: PhaseModelRef | null | undefined): PhaseModelRef | undefined {
-  if (override !== undefined) {
-    return override ?? undefined;
-  }
-  return base ?? undefined;
-}
-
-function resolveThinking(base: ThinkingLevel | null | undefined, override: ThinkingLevel | null | undefined): ThinkingLevel | undefined {
-  if (override !== undefined) {
-    return override ?? undefined;
-  }
-  return base ?? undefined;
-}
-
-function resolveTools(base: string[] | null | undefined, override: string[] | null | undefined): string[] | undefined {
-  if (override !== undefined) {
-    if (override === null) return [];
-    return [...override];
-  }
-  if (base === null) return [];
-  return base ? [...base] : undefined;
 }
 
 function resolveString(base: string | null | undefined, override: string | null | undefined): string | undefined {

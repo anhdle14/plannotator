@@ -1,48 +1,32 @@
 import { describe, expect, test } from "bun:test";
 import {
-	getToolsForPhase,
+	getFileMutationPath,
 	isPlanWritePathAllowed,
-	PLAN_SUBMIT_TOOL,
-	stripPlanningOnlyTools,
-} from "./tool-scope";
+	isPreImplementationPhase,
+} from "./tool-scope.ts";
 
-describe("pi plan tool scoping", () => {
-	test("planning phase adds the submit tool and discovery helpers", () => {
-		expect(getToolsForPhase(["read", "bash", "edit", "write"], "planning")).toEqual([
-			"read",
-			"bash",
-			"edit",
-			"write",
-			"grep",
-			"find",
-			"ls",
-			PLAN_SUBMIT_TOOL,
-		]);
+describe("pre-implementation phases", () => {
+	test("covers planning and grilling only", () => {
+		expect(isPreImplementationPhase("planning")).toBe(true);
+		expect(isPreImplementationPhase("grilling")).toBe(true);
+		expect(isPreImplementationPhase("idle")).toBe(false);
+		expect(isPreImplementationPhase("executing")).toBe(false);
+	});
+});
+
+describe("file mutation tools", () => {
+	test("extracts paths from write, edit, and patch", () => {
+		for (const toolName of ["write", "edit", "patch"]) {
+			expect(getFileMutationPath(toolName, { path: "tmp/plans/auth.md" })).toBe(
+				"tmp/plans/auth.md",
+			);
+		}
 	});
 
-	test("idle and executing phases strip the planning-only submit tool", () => {
-		const leakedTools = ["read", "bash", "grep", PLAN_SUBMIT_TOOL, "write"];
-
-		expect(getToolsForPhase(leakedTools, "idle")).toEqual([
-			"read",
-			"bash",
-			"grep",
-			"write",
-		]);
-		expect(getToolsForPhase(leakedTools, "executing")).toEqual([
-			"read",
-			"bash",
-			"grep",
-			"write",
-		]);
-	});
-
-	test("stripping planning-only tools preserves unrelated tools", () => {
-		expect(stripPlanningOnlyTools([PLAN_SUBMIT_TOOL, "todo", "question", "read"])).toEqual([
-			"todo",
-			"question",
-			"read",
-		]);
+	test("ignores non-mutating tools and malformed inputs", () => {
+		expect(getFileMutationPath("read", { path: "src/app.ts" })).toBeUndefined();
+		expect(getFileMutationPath("edit", {})).toBeUndefined();
+		expect(getFileMutationPath("patch", null)).toBeUndefined();
 	});
 });
 

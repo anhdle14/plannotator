@@ -23,6 +23,12 @@ export const reviewEditorShortcuts = defineShortcutScope({
       section: 'Actions',
       displayOrder: 10,
     },
+    copyFeedback: {
+      description: 'Copy feedback to clipboard',
+      bindings: ['Mod+Shift+Y'],
+      section: 'Actions',
+      displayOrder: 20,
+    },
     focusSearch: {
       description: 'Focus search',
       bindings: ['Mod+F'],
@@ -73,6 +79,13 @@ export const reviewEditorShortcuts = defineShortcutScope({
       section: 'Layout',
       hint: 'Available in dev builds only.',
       displayOrder: 30,
+    },
+    toggleGuide: {
+      description: 'Toggle guided review',
+      bindings: ['Mod+Shift+G'],
+      section: 'Layout',
+      hint: 'Opens or closes the guided review screen takeover.',
+      displayOrder: 40,
     },
     toggleViewed: {
       description: 'Toggle file viewed',

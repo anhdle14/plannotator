@@ -2,6 +2,7 @@ import {
   type DiffType,
   type GitDiffOptions,
   type VcsProvider,
+  createGitButlerProvider,
   createGitProvider,
   createJjProvider,
   createVcsApi,
@@ -14,6 +15,7 @@ import {
   runP4Diff,
 } from "./p4";
 import { runtime as gitRuntime } from "./git";
+import { runtime as gitButlerRuntime } from "./gitbutler";
 import { runtime as jjRuntime } from "./jj";
 
 const p4Provider: VcsProvider = {
@@ -39,7 +41,8 @@ const p4Provider: VcsProvider = {
 };
 
 const api = createVcsApi([
-  createJjProvider(jjRuntime),
+  createJjProvider(jjRuntime, gitRuntime),
+  createGitButlerProvider(gitButlerRuntime),
   createGitProvider(gitRuntime),
   p4Provider,
 ]);
@@ -47,6 +50,7 @@ const api = createVcsApi([
 export const {
   detectVcs,
   detectManagedVcs,
+  vcsOwnsDiffType,
   getVcsContext,
   detectRemoteDefaultCompareTarget,
   prepareLocalReviewDiff,
@@ -57,6 +61,8 @@ export const {
   stageFile,
   unstageFile,
   resolveVcsCwd,
+  vcsSupportsSnapshot,
+  materializeVcsSnapshot,
 } = api;
 
 export { resolveInitialDiffType, gitRuntime };
@@ -75,6 +81,7 @@ export {
   JJ_TRUNK_REVSET,
   jjCompareTargetRevset,
   jjLineBaseRevset,
+  parseCommitDiffType,
   parseRemoteBookmark,
   parseWorktreeDiffType,
   validateFilePath,

@@ -8,6 +8,7 @@ import {
   formatShortcutBindingText,
   formatShortcutBindingTokens,
   getShortcut,
+  listRegistryShortcuts,
   listRegistryShortcutSections,
   matchesKeyName,
   matchesShortcutBinding,
@@ -73,15 +74,24 @@ describe('shortcuts', () => {
 
     expect(planReviewSections.map(section => section.title)).toEqual([
       'Actions',
+      'View',
       'Input Method',
       'Annotations',
+      'Vim Document Navigation',
+      'Vim Text Navigation',
+      'Vim Annotation Actions',
       'Image Annotator',
     ]);
 
     expect(annotateSections.map(section => section.title)).toEqual([
       'Actions',
+      'Sidebar',
+      'View',
       'Input Method',
       'Annotations',
+      'Vim Document Navigation',
+      'Vim Text Navigation',
+      'Vim Annotation Actions',
       'Image Annotator',
     ]);
 
@@ -89,6 +99,7 @@ describe('shortcuts', () => {
     expect(getShortcut(planReviewSettingsShortcutRegistry, 'plan-review-editor-settings', 'submitAnnotations')).toBeUndefined();
     expect(getShortcut(annotateSettingsShortcutRegistry, 'annotate-editor-settings', 'submitAnnotations')?.description).toBe('Send annotations');
     expect(getShortcut(annotateSettingsShortcutRegistry, 'annotate-editor-settings', 'submitPlan')).toBeUndefined();
+    expect(getShortcut(annotateSettingsShortcutRegistry, 'annotate-sidebar', 'toggleContents')?.description).toBe('Toggle Contents sidebar');
 
     expect(reviewSections.map(section => section.title)).toEqual([
       'Actions',
@@ -105,6 +116,21 @@ describe('shortcuts', () => {
     ]);
   });
 
+  // The focus-mode toggle collapses both side panels at once. It has to exist
+  // on BOTH plan surfaces (they render the same panels), and its binding has to
+  // stay the only claim on `Mod+.` there — a second claimant would double-fire,
+  // since the dispatcher has no cross-scope arbitration.
+  it('binds focus mode once on every plan surface', () => {
+    for (const registry of [planReviewSettingsShortcutRegistry, annotateSettingsShortcutRegistry]) {
+      expect(getShortcut(registry, 'document-view', 'toggleFocusMode')?.bindings).toEqual(['Mod+.']);
+
+      const claimants = listRegistryShortcuts(registry)
+        .filter(entry => entry.bindings.includes('Mod+.'))
+        .map(entry => `${entry.scopeId}.${entry.actionId}`);
+      expect(claimants).toEqual(['document-view.toggleFocusMode']);
+    }
+  });
+
   it('matches normalized runtime bindings', () => {
     const submitEvent = { key: 'Enter', ctrlKey: true, metaKey: false, shiftKey: false, altKey: false, code: 'Enter' } as KeyboardEvent;
     const reverseSearchEvent = { key: 'F3', ctrlKey: false, metaKey: false, shiftKey: true, altKey: false, code: 'F3' } as KeyboardEvent;
@@ -112,12 +138,30 @@ describe('shortcuts', () => {
     const quickLabelEvent = { key: '3', ctrlKey: false, metaKey: false, shiftKey: false, altKey: true, code: 'Digit3' } as KeyboardEvent;
     const macOptionQuickLabelEvent = { key: '£', ctrlKey: false, metaKey: false, shiftKey: false, altKey: true, code: 'Digit3' } as KeyboardEvent;
     const wrongEvent = { key: 'Enter', ctrlKey: false, metaKey: false, shiftKey: false, altKey: true, code: 'Enter' } as KeyboardEvent;
+    const spaceEvent = {
+      key: ' ',
+      ctrlKey: false,
+      metaKey: false,
+      shiftKey: false,
+      altKey: false,
+      code: 'Space',
+    };
+    const questionEvent = {
+      key: '?',
+      ctrlKey: false,
+      metaKey: false,
+      shiftKey: true,
+      altKey: false,
+      code: 'Slash',
+    };
 
     expect(matchesShortcutBinding(submitEvent, 'Mod+Enter')).toBe(true);
     expect(matchesShortcutBinding(reverseSearchEvent, 'Shift+F3')).toBe(true);
     expect(matchesShortcutBinding(typeEvent, 'A-Z')).toBe(true);
     expect(matchesShortcutBinding(quickLabelEvent, 'Alt+1-0')).toBe(true);
     expect(matchesShortcutBinding(macOptionQuickLabelEvent, 'Alt+1-0')).toBe(true);
+    expect(matchesShortcutBinding(spaceEvent, 'Space')).toBe(true);
+    expect(matchesShortcutBinding(questionEvent, '?')).toBe(true);
     expect(matchesShortcutBinding(wrongEvent, 'Mod+Enter')).toBe(false);
   });
 

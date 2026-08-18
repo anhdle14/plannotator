@@ -1,0 +1,14 @@
+title = "Plannotator Gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+# Disposition: public, non-secret RFC test vector; reviewed 2026-08-11.
+# Owner: Plannotator maintainers. Re-review by 2027-08-11 or when the fixture is removed.
+description = "RFC 6455 WebSocket handshake example"
+targetRules = ["generic-api-key"]
+regexTarget = "match"
+regexes = [
+  '''Sec-WebSocket-Key:\s*dGhlIHNhbXBsZSBub25jZQ==''',
+]

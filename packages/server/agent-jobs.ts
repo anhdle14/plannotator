@@ -13,6 +13,7 @@ import {
   MARKER_ENGINES,
   formatMarkerLogEvent,
   type MarkerEngine,
+  type MarkerEngineId,
   type MarkerModel,
 } from "./marker-review";
 import {
@@ -26,6 +27,8 @@ import {
   AGENT_HEARTBEAT_COMMENT,
   AGENT_HEARTBEAT_INTERVAL_MS,
 } from "@plannotator/shared/agent-jobs";
+import { resolveGuideLaunchInstructions } from "@plannotator/shared/guide-instructions-store";
+import type { GuideLaunchReview } from "@plannotator/shared/guide-format";
 
 export type { AgentJobInfo, AgentJobEvent, AgentCapabilities } from "@plannotator/shared/agent-jobs";
 
@@ -41,6 +44,16 @@ export interface AgentJobHandler {
   ) => Promise<Response | null>;
   /** Kill all running jobs — call on server shutdown. */
   killAll: () => void;
+  /** Look up a job by id, or undefined if unknown. */
+  getJob: (id: string) => AgentJobInfo | undefined;
+  /**
+   * Flip a terminal failed/killed job to "done" with the given summary — used
+   * when a manual repair (e.g. guide submitManualOutput) succeeds after the
+   * automatic job failed, so the job's status reflects the now-valid result
+   * instead of staying "failed" forever. Returns false when the job is
+   * unknown or not in a terminal failed/killed state.
+   */
+  completeJobExternally: (id: string, summary: AgentJobInfo["summary"]) => boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -58,8 +71,11 @@ const SERVER_BUILT_PROVIDERS: ReadonlySet<string> = new Set([
   "claude",
   "codex",
   "tour",
+  "guide",
   "cursor",
   "opencode",
+  "pi",
+  "copilot",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -69,7 +85,12 @@ const SERVER_BUILT_PROVIDERS: ReadonlySet<string> = new Set([
 export interface AgentJobHandlerOptions {
   /** Which server mode this handler is mounted in. */
   mode: "plan" | "review" | "annotate";
-  /** Returns the server's base URL (e.g., "http://localhost:12345"). Late-bound. */
+  /**
+   * Returns the server's base URL for spawned subprocesses (e.g.,
+   * "http://127.0.0.1:12345"). Late-bound. Jobs run on the same machine, so
+   * this must stay loopback-reachable regardless of any advertised-URL host
+   * override.
+   */
   getServerUrl: () => string;
   /** Returns the working directory for spawned processes. */
   getCwd: () => string;
@@ -97,6 +118,8 @@ export interface AgentJobHandlerOptions {
     reasoningEffort?: string;
     /** Whether Codex fast mode was enabled. */
     fastMode?: boolean;
+    /** Pi's unified reasoning level (marker engines only). */
+    thinking?: string;
     /** PR URL at launch time — used to attribute findings to the correct PR. */
     prUrl?: string;
     /** PR diff scope at launch time — "layer" or "full-stack". */
@@ -107,12 +130,26 @@ export interface AgentJobHandlerOptions {
     reviewProfileId?: string;
     /** Resolved review profile label at launch time. Stored on AgentJobInfo. */
     reviewProfileLabel?: string;
+    /** Changed-file paths as of launch time (guide provider only) — stored per
+     *  job so onJobComplete can validate refs against the SAME file set the
+     *  model planned section placement against, not whatever patch is on
+     *  screen when the job happens to finish. */
+    changedFilesSnapshot?: string[];
+    /** Launch-time review-target snapshot (guide provider only) — stored on
+     *  AgentJobInfo so guide persistence labels the envelope with the context
+     *  the guide was generated against (see AgentJobInfo.guideContext). */
+    guideContext?: AgentJobInfo["guideContext"];
+    /** Launch-time review (patch + labels + source) the guide describes (guide
+     *  provider only). Kept server-side like changedFilesSnapshot — NEVER on
+     *  AgentJobInfo, which is broadcast over SSE — and handed to
+     *  onJobComplete for persistence beside the guide (portable export). */
+    launchReview?: GuideLaunchReview;
   } | null>;
   /**
    * Called after a job process exits with exit code 0.
    * Use for result ingestion (e.g., reading an output file and pushing annotations).
    */
-  onJobComplete?: (job: AgentJobInfo, meta: { outputPath?: string; stdout?: string; cwd?: string }) => void | Promise<void>;
+  onJobComplete?: (job: AgentJobInfo, meta: { outputPath?: string; stdout?: string; cwd?: string; changedFilesSnapshot?: string[]; launchReview?: GuideLaunchReview }) => void | Promise<void>;
 }
 
 
@@ -147,6 +184,8 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
   // --- State ---
   const jobs = new Map<string, { info: AgentJobInfo; proc: ReturnType<typeof Bun.spawn> | null }>();
   const jobOutputPaths = new Map<string, string>();
+  const jobChangedFilesSnapshots = new Map<string, string[]>();
+  const jobLaunchReviews = new Map<string, GuideLaunchReview>();
   const subscribers = new Set<ReadableStreamDefaultController>();
   const encoder = new TextEncoder();
   let version = 0;
@@ -155,25 +194,40 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
   // model catalogs are discovered LAZILY (see buildCapabilitiesResponse) so a
   // slow/unauthenticated `<binary> models` spawn never blocks review-server
   // startup — it runs at most once, on the first /capabilities request. ---
+  // Resolved against the live `process.env.PATH`, which is also what the job
+  // spawn inherits, so detection and execution agree. (`Bun.which` without the
+  // option consults the PATH captured at process start.)
+  const onPath = (binary: string): boolean => !!Bun.which(binary, { PATH: process.env.PATH });
   const capabilities: AgentCapability[] = [
-    { id: "claude", name: "Claude Code", available: !!Bun.which("claude") },
-    { id: "codex", name: "Codex CLI", available: !!Bun.which("codex") },
-    { id: "tour", name: "Code Tour", available: !!Bun.which("claude") || !!Bun.which("codex") },
+    { id: "claude", name: "Claude Code", available: onPath("claude") },
+    { id: "codex", name: "Codex CLI", available: onPath("codex") },
+    { id: "tour", name: "Code Tour", available: onPath("claude") || onPath("codex") },
+    {
+      id: "guide",
+      name: "Guided Review",
+      // Guided Review also runs on the marker engines (Cursor, OpenCode, Pi) —
+      // same review-mode + binary-on-PATH gating as their own capability
+      // entries below (NOTE: cursor's binary is `agent`).
+      available:
+        onPath("claude") ||
+        onPath("codex") ||
+        (mode === "review" && Object.values(MARKER_ENGINES).some((engine) => onPath(engine.binary))),
+    },
   ];
-  // Marker engines (Cursor, OpenCode) — same shape, one loop. Available only in
-  // review mode when the binary is on PATH (NOTE: cursor's binary is `agent`).
+  // Marker engines (Cursor, OpenCode, Pi) — same shape, one loop. Available only
+  // in review mode when the binary is on PATH (NOTE: cursor's binary is `agent`).
   for (const engine of Object.values(MARKER_ENGINES)) {
     capabilities.push({
       id: engine.id,
       name: engine.name,
-      available: mode === "review" && !!Bun.which(engine.binary),
+      available: mode === "review" && onPath(engine.binary),
     });
   }
 
   const markerModelsCache = new Map<string, MarkerModel[]>();
   async function buildCapabilitiesResponse(): Promise<AgentCapabilities> {
     const providers = await Promise.all(capabilities.map(async (c) => {
-      const engine = MARKER_ENGINES[c.id as "cursor" | "opencode"];
+      const engine = MARKER_ENGINES[c.id as MarkerEngineId];
       if (!engine || !c.available) return c;
       let models = markerModelsCache.get(engine.id);
       if (!models) {
@@ -205,7 +259,7 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
     command: string[],
     label: string,
     outputPath?: string,
-    spawnOptions?: { captureStdout?: boolean; stdinPrompt?: string; cwd?: string; prompt?: string; engine?: string; model?: string; effort?: string; reasoningEffort?: string; fastMode?: boolean; prUrl?: string; diffScope?: string; diffContext?: AgentJobInfo["diffContext"]; reviewProfileId?: string; reviewProfileLabel?: string },
+    spawnOptions?: { captureStdout?: boolean; stdinPrompt?: string; cwd?: string; prompt?: string; engine?: string; model?: string; effort?: string; reasoningEffort?: string; fastMode?: boolean; thinking?: string; prUrl?: string; diffScope?: string; diffContext?: AgentJobInfo["diffContext"]; reviewProfileId?: string; reviewProfileLabel?: string; changedFilesSnapshot?: string[]; guideContext?: AgentJobInfo["guideContext"]; launchReview?: GuideLaunchReview },
   ): AgentJobInfo {
     const source = jobSource(id);
 
@@ -223,9 +277,11 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
       ...(spawnOptions?.effort && { effort: spawnOptions.effort }),
       ...(spawnOptions?.reasoningEffort && { reasoningEffort: spawnOptions.reasoningEffort }),
       ...(spawnOptions?.fastMode && { fastMode: spawnOptions.fastMode }),
+      ...(spawnOptions?.thinking && { thinking: spawnOptions.thinking }),
       ...(spawnOptions?.prUrl && { prUrl: spawnOptions.prUrl }),
       ...(spawnOptions?.diffScope && { diffScope: spawnOptions.diffScope }),
       ...(spawnOptions?.diffContext && { diffContext: spawnOptions.diffContext }),
+      ...(spawnOptions?.guideContext && { guideContext: spawnOptions.guideContext }),
       ...(spawnOptions?.reviewProfileId && { reviewProfileId: spawnOptions.reviewProfileId }),
       ...(spawnOptions?.reviewProfileLabel && { reviewProfileLabel: spawnOptions.reviewProfileLabel }),
     };
@@ -263,6 +319,8 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
       jobs.set(id, { info, proc });
       if (outputPath) jobOutputPaths.set(id, outputPath);
       if (spawnOptions?.cwd) jobOutputPaths.set(`${id}:cwd`, spawnOptions.cwd);
+      if (spawnOptions?.changedFilesSnapshot) jobChangedFilesSnapshots.set(id, spawnOptions.changedFilesSnapshot);
+      if (spawnOptions?.launchReview) jobLaunchReviews.set(id, spawnOptions.launchReview);
       broadcast({ type: "job:started", job: { ...info } });
 
       // Drain stderr: capture tail for error reporting + broadcast live log deltas
@@ -316,10 +374,15 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
                 if (formatted !== null) broadcast({ type: "job:log", jobId: id, delta: formatted + '\n' });
                 return;
               }
-              // Marker engines (Cursor, OpenCode): map their NDJSON stream events
+              // Marker engines (Cursor, OpenCode, Pi): map their NDJSON stream events
               // into readable log deltas via the engine's own formatter (Cursor
-              // applies the partial-output dedup rule; OpenCode reads text parts).
-              const markerEngine = MARKER_ENGINES[provider as "cursor" | "opencode"];
+              // applies the partial-output dedup rule; OpenCode reads text parts;
+              // Pi reads message_end/tool_execution_start).
+              // Guide jobs keep provider: "guide" and carry the marker engine on
+              // spawnOptions.engine instead — fall back to that lookup so guide
+              // logs get the same readable formatting as review jobs.
+              const markerEngine = MARKER_ENGINES[provider as MarkerEngineId]
+                ?? (spawnOptions?.engine ? MARKER_ENGINES[spawnOptions.engine as MarkerEngineId] : undefined);
               if (markerEngine) {
                 const formatted = formatMarkerLogEvent(line, markerEngine);
                 if (formatted !== null) broadcast({ type: "job:log", jobId: id, delta: formatted + '\n' });
@@ -370,28 +433,43 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
         // Ingest results before broadcasting completion so annotations arrive first
         const outputPath = jobOutputPaths.get(id);
         const jobCwd = jobOutputPaths.get(`${id}:cwd`);
+        const changedFilesSnapshot = jobChangedFilesSnapshots.get(id);
+        const launchReview = jobLaunchReviews.get(id);
         if (exitCode === 0 && options.onJobComplete) {
           try {
             await options.onJobComplete(entry.info, {
               outputPath,
               stdout: captureStdout ? stdoutBuf : undefined,
               cwd: jobCwd,
+              changedFilesSnapshot,
+              launchReview,
             });
           } catch (err) {
-            // Claude/Codex are fail-open: an ingestion error is logged but does
-            // not change the terminal state. Cursor and OpenCode are fail-closed
-            // — their findings are prompt-enforced, so an unexpected throw here
-            // must surface as a failed job rather than a green one. (Their
-            // handlers normally fail by mutation and never throw; this guards
-            // future refactors.)
-            if (MARKER_ENGINES[provider as "cursor" | "opencode"]) {
+            // Claude/Codex REVIEW jobs stay fail-open by design: annotations
+            // may already be partially ingested by the time something throws,
+            // and flipping the job to "failed" would hide a review the user
+            // can otherwise still see/use. Cursor, OpenCode, and Pi are
+            // fail-closed — their findings are prompt-enforced, so an unexpected
+            // throw here must surface as a failed job rather than a green one.
+            // (Their handlers normally fail by mutation and never throw; this
+            // guards future refactors.) Tour and guide widen that fail-closed
+            // rule too: both are single-shot, all-or-nothing outputs (a tour's
+            // stops/checklist, a guide's sections) with nothing meaningful
+            // partially ingested, so an unexpected throw here means the whole
+            // result is unusable — it must not sit at "done" with no content.
+            if (MARKER_ENGINES[provider as MarkerEngineId]) {
               entry.info.status = "failed";
               entry.info.error = err instanceof Error ? err.message : `${provider} result ingestion failed`;
+            } else if (provider === "tour" || provider === "guide") {
+              entry.info.status = "failed";
+              entry.info.error = `Result ingestion failed: ${err instanceof Error ? err.message : String(err)}`;
             }
           }
         }
         jobOutputPaths.delete(id);
         jobOutputPaths.delete(`${id}:cwd`);
+        jobChangedFilesSnapshots.delete(id);
+        jobLaunchReviews.delete(id);
         broadcast({ type: "job:completed", job: { ...entry.info } });
       }).catch(() => {
         // Guard against unhandled rejection from unexpected runtime errors
@@ -427,6 +505,8 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
     entry.info.endedAt = Date.now();
     jobOutputPaths.delete(id);
     jobOutputPaths.delete(`${id}:cwd`);
+    jobChangedFilesSnapshots.delete(id);
+    jobLaunchReviews.delete(id);
     broadcast({ type: "job:completed", job: { ...entry.info } });
     return true;
   }
@@ -446,9 +526,33 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
     return Array.from(jobs.values()).map((e) => ({ ...e.info }));
   }
 
+  function getJob(id: string): AgentJobInfo | undefined {
+    const entry = jobs.get(id);
+    return entry ? { ...entry.info } : undefined;
+  }
+
+  function completeJobExternally(id: string, summary: AgentJobInfo["summary"]): boolean {
+    const entry = jobs.get(id);
+    if (!entry) return false;
+    if (entry.info.status !== "failed" && entry.info.status !== "killed") return false;
+
+    entry.info.status = "done";
+    entry.info.error = undefined;
+    entry.info.summary = summary;
+    // The FAILED run's exit code would otherwise survive the manual repair —
+    // the job detail UI keys its "Exit N" chip off it, so a successfully
+    // repaired guide kept flagging Exit 1. The job's OUTCOME is now success;
+    // the original process's exit lives on in the captured logs.
+    entry.info.exitCode = 0;
+    broadcast({ type: "job:completed", job: { ...entry.info } });
+    return true;
+  }
+
   // --- HTTP handler ---
   return {
     killAll,
+    getJob,
+    completeJobExternally,
 
     async handle(
       req: Request,
@@ -526,8 +630,8 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
           // custom-reviews spec — a typo'd field should fail loud, not no-op).
           const KNOWN_JOB_FIELDS = new Set([
             "provider", "command", "label",
-            "engine", "model", "reasoningEffort", "effort", "fastMode",
-            "reviewProfileId",
+            "engine", "model", "reasoningEffort", "effort", "thinking", "fastMode",
+            "reviewProfileId", "repairOf", "instructions",
           ]);
           if (body && typeof body === "object") {
             const unknown = Object.keys(body).filter((k) => !KNOWN_JOB_FIELDS.has(k));
@@ -580,11 +684,15 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
           let jobEffort: string | undefined;
           let jobReasoningEffort: string | undefined;
           let jobFastMode: boolean | undefined;
+          let jobThinking: string | undefined;
           let jobPrUrl: string | undefined;
           let jobDiffScope: string | undefined;
           let jobDiffContext: AgentJobInfo["diffContext"] | undefined;
           let jobReviewProfileId: string | undefined;
           let jobReviewProfileLabel: string | undefined;
+          let jobChangedFilesSnapshot: string[] | undefined;
+          let jobGuideContext: AgentJobInfo["guideContext"] | undefined;
+          let jobLaunchReview: GuideLaunchReview | undefined;
           const jobId = crypto.randomUUID();
           if (options.buildCommand) {
             // Thread config from POST body to buildCommand
@@ -593,8 +701,17 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
             if (typeof body.model === "string") config.model = body.model;
             if (typeof body.reasoningEffort === "string") config.reasoningEffort = body.reasoningEffort;
             if (typeof body.effort === "string") config.effort = body.effort;
+            if (typeof body.thinking === "string") config.thinking = body.thinking;
             if (body.fastMode === true) config.fastMode = true;
             if (typeof body.reviewProfileId === "string") config.reviewProfileId = body.reviewProfileId;
+            if (typeof body.repairOf === "string") config.repairOf = body.repairOf;
+            // Guide extra instructions (#1265): explicit launch text wins,
+            // else the server-stored standing instructions apply; neither
+            // yields text and launches build the exact same prompts as before.
+            const launchInstructions = provider === "guide"
+              ? resolveGuideLaunchInstructions(body.instructions)
+              : undefined;
+            if (launchInstructions !== undefined) config.instructions = launchInstructions;
             const built = await options.buildCommand(provider, Object.keys(config).length > 0 ? config : undefined);
             if (built) {
               command = built.command;
@@ -609,11 +726,15 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
               jobEffort = built.effort;
               jobReasoningEffort = built.reasoningEffort;
               jobFastMode = built.fastMode;
+              jobThinking = built.thinking;
               jobPrUrl = built.prUrl;
               jobDiffScope = built.diffScope;
               jobDiffContext = built.diffContext;
               jobReviewProfileId = built.reviewProfileId;
               jobReviewProfileLabel = built.reviewProfileLabel;
+              jobChangedFilesSnapshot = built.changedFilesSnapshot;
+              jobGuideContext = built.guideContext;
+              jobLaunchReview = built.launchReview;
             }
           }
 
@@ -634,11 +755,15 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
             effort: jobEffort,
             reasoningEffort: jobReasoningEffort,
             fastMode: jobFastMode,
+            thinking: jobThinking,
             prUrl: jobPrUrl,
             diffScope: jobDiffScope,
             diffContext: jobDiffContext,
             reviewProfileId: jobReviewProfileId,
             reviewProfileLabel: jobReviewProfileLabel,
+            changedFilesSnapshot: jobChangedFilesSnapshot,
+            guideContext: jobGuideContext,
+            launchReview: jobLaunchReview,
           });
           return Response.json({ job }, { status: 201 });
         } catch (err) {

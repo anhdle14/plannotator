@@ -6,12 +6,13 @@
  */
 
 import React from "react";
+import { Search, X } from "lucide-react";
 import type { VaultNode } from "../../types";
 import type { DirState } from "../../hooks/useFileBrowser";
 import { CountBadge } from "./CountBadge";
 import { ObsidianIconRaw } from "../icons/ObsidianIcons";
-import type { WorkspaceFileChange, WorkspaceStatusPayload } from "@plannotator/shared/workspace-status";
-import { normalizeBrowserPath } from "@plannotator/shared/browser-paths";
+import type { WorkspaceFileChange, WorkspaceStatusPayload } from "@plannotator/core/workspace-status-types";
+import { normalizeBrowserPath } from "@plannotator/core/browser-paths";
 
 interface FileBrowserProps {
   dirs: DirState[];
@@ -26,6 +27,8 @@ interface FileBrowserProps {
   annotationCounts?: Map<string, number>;
   highlightedFiles?: Set<string>;
   editStatuses?: Map<string, FileEditStatus>;
+  /** Prevent competing destination changes while a document is activating. */
+  selectionPending?: boolean;
 }
 
 export interface FileEditStatus {
@@ -40,6 +43,43 @@ interface AggregateWorkspaceChange {
   additions: number;
   deletions: number;
   files: number;
+}
+
+// Display-name stripping only — deliberately narrower than the annotatable
+// set. Config files (config.yaml vs config.json) keep their extensions so
+// same-named siblings stay distinguishable in the tree.
+const FILE_EXTENSION_RE = /\.(mdx?|txt|html?)$/i;
+
+function normalizeFilterText(value: string): string {
+  return value.replace(/\\/g, "/").toLowerCase();
+}
+
+export function getFileTreeFilterTokens(query: string): string[] {
+  return normalizeFilterText(query)
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function nodeMatchesFilter(node: VaultNode, tokens: string[]): boolean {
+  if (tokens.length === 0) return true;
+  const displayName = node.name.replace(FILE_EXTENSION_RE, "");
+  const haystack = normalizeFilterText(`${node.name} ${displayName} ${node.path}`);
+  return tokens.every((token) => haystack.includes(token));
+}
+
+export function filterFileTree(nodes: VaultNode[], tokens: string[]): VaultNode[] {
+  if (tokens.length === 0) return nodes;
+
+  return nodes.flatMap((node) => {
+    if (node.type === "file") return nodeMatchesFilter(node, tokens) ? [node] : [];
+
+    if (nodeMatchesFilter(node, tokens)) return [node];
+
+    const children = filterFileTree(node.children ?? [], tokens);
+    if (children.length === 0) return [];
+    return [{ ...node, children }];
+  });
 }
 
 export function normalizePathForLookup(path: string): string {
@@ -207,21 +247,27 @@ const TreeNode: React.FC<{
   highlightedFiles?: Set<string>;
   editStatuses?: Map<string, FileEditStatus>;
   workspaceStatus?: WorkspaceStatusPayload;
-}> = ({ node, depth, dirPath, expandedFolders, onToggleFolder, onSelectFile, activeFile, annotationCounts, highlightedFiles, editStatuses, workspaceStatus }) => {
+  forceExpandFolders?: boolean;
+  selectionPending?: boolean;
+}> = ({ node, depth, dirPath, expandedFolders, onToggleFolder, onSelectFile, activeFile, annotationCounts, highlightedFiles, editStatuses, workspaceStatus, forceExpandFolders = false, selectionPending = false }) => {
   const folderKey = `${dirPath}:${node.path}`;
   const absolutePath = `${dirPath}/${node.path}`;
-  const isExpanded = expandedFolders.has(folderKey);
+  const isExpanded = forceExpandFolders || expandedFolders.has(folderKey);
   const isActive = node.type === "file" && absolutePath === activeFile;
   const paddingLeft = 8 + depth * 14;
 
   if (node.type === "folder") {
     const aggregateCount = annotationCounts ? getAggregateCount(node, dirPath, annotationCounts, workspaceStatus) : 0;
     const aggregateChange = getAggregateWorkspaceChange(node, dirPath, workspaceStatus);
+    const folderButtonClassName = forceExpandFolders
+      ? "file-tree-folder w-full flex items-center gap-1.5 py-1 px-2 text-[11px] text-muted-foreground transition-colors rounded-sm cursor-default disabled:opacity-100"
+      : "file-tree-folder w-full flex items-center gap-1.5 py-1 px-2 text-[11px] text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors rounded-sm";
     return (
       <>
         <button
+          disabled={forceExpandFolders}
           onClick={() => onToggleFolder(folderKey)}
-          className="file-tree-folder w-full flex items-center gap-1.5 py-1 px-2 text-[11px] text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors rounded-sm"
+          className={folderButtonClassName}
           style={{ paddingLeft }}
         >
           <svg
@@ -261,6 +307,8 @@ const TreeNode: React.FC<{
             highlightedFiles={highlightedFiles}
             editStatuses={editStatuses}
             workspaceStatus={workspaceStatus}
+            forceExpandFolders={forceExpandFolders}
+            selectionPending={selectionPending}
           />
         ))}
       </>
@@ -303,7 +351,8 @@ const TreeNode: React.FC<{
       onClick={() => {
         if (!isSelectionDisabled) onSelectFile(absolutePath, dirPath);
       }}
-      disabled={isSelectionDisabled}
+      disabled={isSelectionDisabled || selectionPending}
+      aria-busy={isActive && selectionPending ? true : undefined}
       className={`file-tree-item w-full text-left group ${isActive ? "active" : ""} ${fileCount > 0 ? "has-annotations" : ""} ${isHighlighted ? 'file-annotation-flash' : ''} ${isSelectionDisabled ? 'opacity-70 cursor-default' : ''}`}
       style={{ paddingLeft: paddingLeft + 15 }}
       title={isDeleted ? `${node.path} (${editStatus?.status === "missing" ? "missing on disk" : "deleted on disk"})` : node.path}
@@ -313,6 +362,9 @@ const TreeNode: React.FC<{
       </svg>
       <span className={`truncate flex-1 min-w-0 ${isDeleted ? "line-through" : ""}`}>{displayName}</span>
       <div className="ml-auto flex flex-shrink-0 items-center gap-1.5 text-[10px]">
+        {isActive && selectionPending && (
+          <span className="text-primary">Opening…</span>
+        )}
         {editMarker && (
           <span
             className={`inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[9px] font-semibold leading-none ${editMarker.className}`}
@@ -348,7 +400,9 @@ const DirSection: React.FC<{
   annotationCounts?: Map<string, number>;
   highlightedFiles?: Set<string>;
   editStatuses?: Map<string, FileEditStatus>;
-}> = ({ dir, expandedFolders, onToggleFolder, onSelectFile, activeFile, onRetry, annotationCounts, highlightedFiles, editStatuses }) => {
+  forceExpandFolders?: boolean;
+  selectionPending?: boolean;
+}> = ({ dir, expandedFolders, onToggleFolder, onSelectFile, activeFile, onRetry, annotationCounts, highlightedFiles, editStatuses, forceExpandFolders = false, selectionPending = false }) => {
   const workspaceStatus = React.useMemo(() => normalizeWorkspaceStatus(dir.workspaceStatus), [dir.workspaceStatus]);
 
   if (dir.isLoading) {
@@ -376,7 +430,7 @@ const DirSection: React.FC<{
   if (dir.tree.length === 0) {
     return (
       <div className="px-3 py-2 text-[11px] text-muted-foreground">
-        No markdown or text files found
+        No annotatable files found
       </div>
     );
   }
@@ -397,6 +451,8 @@ const DirSection: React.FC<{
           highlightedFiles={highlightedFiles}
           editStatuses={editStatuses}
           workspaceStatus={workspaceStatus}
+          forceExpandFolders={forceExpandFolders}
+          selectionPending={selectionPending}
         />
       ))}
     </div>
@@ -416,7 +472,32 @@ export const FileBrowser: React.FC<FileBrowserProps> = ({
   annotationCounts,
   highlightedFiles,
   editStatuses,
+  selectionPending = false,
 }) => {
+  const [isFilterOpen, setIsFilterOpen] = React.useState(false);
+  const [filterQuery, setFilterQuery] = React.useState("");
+  const inputRef = React.useRef<HTMLInputElement>(null);
+  const deferredFilterQuery = React.useDeferredValue(filterQuery);
+  const filterTokens = React.useMemo(() => getFileTreeFilterTokens(deferredFilterQuery), [deferredFilterQuery]);
+  const isFiltering = filterTokens.length > 0;
+  const showFilterInput = isFilterOpen || filterQuery.trim().length > 0;
+  const visibleDirs = React.useMemo(() => {
+    if (!isFiltering) return dirs;
+    return dirs
+      .map((dir) => ({ ...dir, tree: filterFileTree(dir.tree, filterTokens) }))
+      .filter((dir) => dir.isLoading || dir.error || dir.tree.length > 0);
+  }, [dirs, filterTokens, isFiltering]);
+  const handleFilterBlur = React.useCallback((event: React.FocusEvent<HTMLDivElement>) => {
+    if (filterQuery.trim()) return;
+    if (event.currentTarget.contains(event.relatedTarget)) return;
+    setIsFilterOpen(false);
+  }, [filterQuery]);
+
+  React.useEffect(() => {
+    if (!showFilterInput) return;
+    inputRef.current?.focus();
+  }, [showFilterInput]);
+
   if (dirs.length === 0) {
     return (
       <div className="p-3 text-[11px] text-muted-foreground">
@@ -454,8 +535,66 @@ export const FileBrowser: React.FC<FileBrowserProps> = ({
           {workspaceTotals.deletions > 0 && <span className={`deletions ${workspaceTotals.additions > 0 ? "" : "ml-auto"}`}>-{workspaceTotals.deletions}</span>}
         </div>
       )}
-      {dirs.map((dir) => {
-        const isCollapsed = collapsedDirs.has(dir.path);
+      <div className="border-b border-border/20 px-2 py-0.5">
+        {showFilterInput ? (
+          <div
+            onBlur={handleFilterBlur}
+            className="file-browser-filter-field flex h-6 items-center gap-1.5 rounded-sm bg-muted/25 px-1.5 text-muted-foreground focus-within:bg-muted/40"
+          >
+            <Search size={12} className="shrink-0 text-muted-foreground/55" aria-hidden="true" />
+            <input
+              ref={inputRef}
+              type="search"
+              value={filterQuery}
+              onChange={(event) => setFilterQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== "Escape") return;
+                if (filterQuery) setFilterQuery("");
+                else setIsFilterOpen(false);
+              }}
+              placeholder="Filter"
+              aria-label="Filter files"
+              autoComplete="off"
+              spellCheck={false}
+              data-lpignore="true"
+              data-1p-ignore
+              className="file-browser-filter-input h-full min-w-0 flex-1 bg-transparent p-0 text-[16px] leading-4 text-foreground outline-none placeholder:text-muted-foreground/45 sm:text-[11px]"
+            />
+            {filterQuery && (
+              <button
+                type="button"
+                onClick={() => {
+                  setFilterQuery("");
+                  inputRef.current?.focus();
+                }}
+                className="file-browser-filter-clear flex h-5 w-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground/55 hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:bg-muted"
+                aria-label="Clear file filter"
+                title="Clear file filter"
+              >
+                <X size={12} aria-hidden="true" />
+              </button>
+            )}
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setIsFilterOpen(true)}
+            className="flex h-6 w-full items-center gap-1.5 rounded-sm px-1.5 text-left text-[10px] text-muted-foreground hover:bg-muted/40 hover:text-foreground focus-visible:outline-none focus-visible:bg-muted/50 focus-visible:text-foreground"
+            aria-label="Filter files"
+            title="Filter files"
+          >
+            <Search size={12} className="shrink-0 text-muted-foreground/55" aria-hidden="true" />
+            <span className="truncate">Filter</span>
+          </button>
+        )}
+      </div>
+      {isFiltering && visibleDirs.length === 0 && (
+        <div className="px-3 py-8 text-center text-[11px] text-muted-foreground">
+          No files match "{deferredFilterQuery.trim()}"
+        </div>
+      )}
+      {visibleDirs.map((dir) => {
+        const isCollapsed = !isFiltering && collapsedDirs.has(dir.path);
         return (
           <div key={dir.path}>
             <button
@@ -488,6 +627,8 @@ export const FileBrowser: React.FC<FileBrowserProps> = ({
                 annotationCounts={annotationCounts}
                 highlightedFiles={highlightedFiles}
                 editStatuses={editStatuses}
+                forceExpandFolders={isFiltering}
+                selectionPending={selectionPending}
               />
             )}
           </div>

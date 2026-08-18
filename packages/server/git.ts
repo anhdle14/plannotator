@@ -5,11 +5,15 @@
  * Used by both Claude Code hook and OpenCode plugin.
  */
 
+import { lstat, readlink } from "node:fs/promises";
+import { resolve as resolvePath } from "node:path";
+
 import {
   type DiffOption,
   type DiffResult,
   type DiffType,
   type GitCommandResult,
+  type GitCommandOptions,
   type GitContext,
   type GitDiffOptions,
   type ReviewGitRuntime,
@@ -22,6 +26,7 @@ import {
   gitAddFile as gitAddFileCore,
   gitResetFile as gitResetFileCore,
   parseWorktreeDiffType,
+  prepareGitCommand,
   runGitDiff as runGitDiffCore,
   runGitDiffWithContext as runGitDiffWithContextCore,
   validateFilePath,
@@ -38,17 +43,41 @@ export type {
 
 async function runGit(
   args: string[],
-  options?: { cwd?: string; timeoutMs?: number },
+  options?: GitCommandOptions,
 ): Promise<GitCommandResult> {
-  const proc = Bun.spawn(["git", "-c", "core.quotePath=false", ...args], {
+  const command = prepareGitCommand(args, options, process.env);
+  const proc = Bun.spawn(["git", ...command.args], {
     cwd: options?.cwd,
+    detached: command.isolateProcessGroup,
+    env: command.env,
+    stdin: options?.stdin === undefined
+      ? "ignore"
+      : new TextEncoder().encode(options.stdin),
     stdout: "pipe",
     stderr: "pipe",
+    windowsHide: true,
   });
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   if (options?.timeoutMs) {
-    timer = setTimeout(() => proc.kill(), options.timeoutMs);
+    timer = setTimeout(() => {
+      if (command.isolateProcessGroup && process.platform !== "win32") {
+        try {
+          process.kill(-proc.pid, "SIGKILL");
+          return;
+        } catch {
+          // Fall through when the process exited between the timer and signal.
+        }
+      }
+      if (command.isolateProcessGroup && process.platform === "win32") {
+        const killed = Bun.spawnSync(
+          ["taskkill.exe", "/pid", String(proc.pid), "/t", "/f"],
+          { stdin: "ignore", stdout: "ignore", stderr: "ignore", windowsHide: true },
+        );
+        if (killed.exitCode === 0) return;
+      }
+      proc.kill("SIGKILL");
+    }, options.timeoutMs);
   }
 
   const [stdout, stderr, exitCode] = await Promise.all([
@@ -68,6 +97,29 @@ export const runtime: ReviewGitRuntime = {
   async readTextFile(path: string): Promise<string | null> {
     try {
       return await Bun.file(path).text();
+    } catch {
+      return null;
+    }
+  },
+  async getFileInfo(basePath, path) {
+    const fullPath = resolvePath(basePath ?? "", path);
+    try {
+      const fileStat = await lstat(fullPath);
+      return {
+        path: fullPath,
+        size: fileStat.size,
+        mtimeMs: fileStat.mtimeMs,
+        isFile: fileStat.isFile(),
+        isSymbolicLink: fileStat.isSymbolicLink(),
+        isExecutable: (fileStat.mode & 0o111) !== 0,
+      };
+    } catch {
+      return null;
+    }
+  },
+  async readLink(path: string): Promise<string | null> {
+    try {
+      return await readlink(path);
     } catch {
       return null;
     }

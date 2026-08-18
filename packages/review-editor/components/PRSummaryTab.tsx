@@ -1,101 +1,16 @@
-import React, { useMemo, useRef, useEffect } from 'react';
-import { parseMarkdownToBlocks } from '@plannotator/ui/utils/parser';
-import { sanitizeInlineHtml } from '@plannotator/ui/utils/sanitizeHtml';
+import React from 'react';
 import { AnnotatableDescription } from './AnnotatableDescription';
-import { renderInlineMarkdown } from '../utils/renderInlineMarkdown';
+import { MarkdownBody } from './MarkdownBody';
 import type { PRContext, PRMetadata } from '@plannotator/shared/pr-types';
 
 interface PRSummaryTabProps {
   context: PRContext;
   metadata: PRMetadata;
+  compact?: boolean;
 }
-
-/** Check if content contains HTML tags that should be rendered natively. */
-const HTML_TAG_RE = /<[a-z][a-z0-9]*[\s/>]/i;
-const containsHtml = (text: string) => HTML_TAG_RE.test(text);
-
-/** Renders sanitized HTML and hides broken images via ref (no inline event handlers). */
-function SafeHtml({ html, as: Tag = 'div' }: { html: string; as?: 'div' | 'span' }) {
-  const ref = useRef<HTMLElement>(null);
-  useEffect(() => {
-    if (!ref.current) return;
-    const imgs = ref.current.querySelectorAll('img');
-    imgs.forEach((img) => {
-      img.onerror = () => { img.style.display = 'none'; img.onerror = null; };
-    });
-  }, [html]);
-  return <Tag ref={ref as any} dangerouslySetInnerHTML={{ __html: html }} />;
-}
-
-/**
- * Render inline content — if it contains HTML tags, sanitize and render.
- * Otherwise use our markdown renderer.
- */
-function renderContent(content: string): React.ReactNode {
-  if (containsHtml(content)) {
-    return <SafeHtml html={sanitizeInlineHtml(content)} as="span" />;
-  }
-  return renderInlineMarkdown(content);
-}
-
-/** Render a simplified block-level markdown view (no annotation infrastructure). */
-export function MarkdownBody({ markdown, textClassName = 'text-xs' }: { markdown: string; textClassName?: string }) {
-  const blocks = useMemo(() => parseMarkdownToBlocks(markdown), [markdown]);
-
+export const PRSummaryTab: React.FC<PRSummaryTabProps> = React.memo(({ context, metadata, compact = false }) => {
   return (
-    <div className={`space-y-2.5 ${textClassName} text-foreground/90 leading-relaxed`}>
-      {blocks.map((block) => {
-        switch (block.type) {
-          case 'heading': {
-            const Tag = `h${Math.min(block.level ?? 1, 6)}` as keyof JSX.IntrinsicElements;
-            const sizes: Record<number, string> = {
-              1: 'text-base font-bold',
-              2: 'text-sm font-semibold',
-              3: 'text-xs font-semibold',
-            };
-            return (
-              <Tag key={block.id} className={`${sizes[block.level ?? 1] ?? 'text-xs font-medium'} text-foreground`}>
-                {renderContent(block.content)}
-              </Tag>
-            );
-          }
-          case 'code':
-            return (
-              <pre key={block.id} className="bg-muted/50 rounded-md p-2 text-[11px] font-mono overflow-x-auto whitespace-pre-wrap">
-                <code>{block.content}</code>
-              </pre>
-            );
-          case 'list-item':
-            return (
-              <div key={block.id} className="flex gap-1.5" style={{ paddingLeft: (block.level ?? 0) * 12 }}>
-                <span className="text-muted-foreground shrink-0">{block.checked !== undefined ? (block.checked ? '☑' : '☐') : '•'}</span>
-                <span>{renderContent(block.content)}</span>
-              </div>
-            );
-          case 'blockquote':
-            return (
-              <blockquote key={block.id} className="border-l-2 border-border pl-2 text-muted-foreground italic">
-                {renderContent(block.content)}
-              </blockquote>
-            );
-          case 'hr':
-            return <hr key={block.id} className="border-border/50" />;
-          default:
-            if (!block.content) return null;
-            // If the entire paragraph is HTML, sanitize and render
-            if (containsHtml(block.content)) {
-              return <SafeHtml key={block.id} html={sanitizeInlineHtml(block.content)} />;
-            }
-            return <p key={block.id}>{renderInlineMarkdown(block.content)}</p>;
-        }
-      })}
-    </div>
-  );
-}
-
-export const PRSummaryTab: React.FC<PRSummaryTabProps> = React.memo(({ context, metadata }) => {
-  return (
-    <div className="px-8 py-4 space-y-4 max-w-2xl">
+    <div className={`${compact ? 'px-4' : 'px-8'} py-4 space-y-4 max-w-2xl`}>
       {/* PR title + state */}
       <div className="space-y-2">
         <div className="flex items-start gap-2">
@@ -120,8 +35,8 @@ export const PRSummaryTab: React.FC<PRSummaryTabProps> = React.memo(({ context, 
           </a>
         </div>
 
-        <div className="text-[10px] text-muted-foreground font-mono">
-          {metadata.author} wants to merge <code className="bg-muted px-1 rounded">{metadata.headBranch}</code> into <code className="bg-muted px-1 rounded">{metadata.baseBranch}</code>
+        <div className="text-[10px] text-muted-foreground font-mono break-words">
+          {metadata.author} wants to merge <code className="bg-muted px-1 rounded break-all">{metadata.headBranch}</code> into <code className="bg-muted px-1 rounded break-all">{metadata.baseBranch}</code>
         </div>
         {metadata.defaultBranch && metadata.baseBranch !== metadata.defaultBranch && (
           <div className="inline-flex items-center gap-1.5 rounded border border-accent/20 bg-accent/10 px-2 py-1 text-[10px] text-accent">

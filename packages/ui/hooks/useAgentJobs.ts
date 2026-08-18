@@ -28,9 +28,55 @@ export type AgentLaunchParams = {
   model?: string;
   reasoningEffort?: string;
   effort?: string;
+  /** Pi's unified reasoning level (`--thinking off|minimal|low|medium|high|xhigh`). */
+  thinking?: string;
   fastMode?: boolean;
   reviewProfileId?: string;
+  /** Launches a guide-repair job against a failed guide job's captured output
+   *  (see GuideEmptyState's failure-recovery panel). The server resolves a
+   *  schema-capable engine and starts a new, normal guide job rather than
+   *  mutating the failed one in place. */
+  repairOf?: string;
+  /** Reviewer-supplied extra instructions (#1265), appended to the Guided
+   *  Review organizer prompt. Guide launches only; other providers ignore it. */
+  instructions?: string;
 };
+
+/** Does a job belong to the given review context? Jobs launched against a PR
+ *  are stamped with that PR's url; local-diff jobs carry none. Used to scope
+ *  guide/tour auto-opens, the guide takeover, and "Open guide" affordances so
+ *  an artifact from PR A never opens (or offers to open) while reviewing PR B.
+ *  `currentPrUrl` undefined ⇒ local-diff mode.
+ *
+ *  prUrl + worktreePath define WHERE the review is (the context — matched
+ *  strictly below); mode/base/scope define WHAT VIEW of that context is on
+ *  screen. In PR mode only prUrl is compared (a PR checkout has no separate
+ *  worktree axis). In local-diff mode, `currentWorktreePath` distinguishes a
+ *  review retargeted at a git worktree (`worktree:<path>:<subType>` diff
+ *  types — see parseWorktreeDiffType) from the main tree, so a guide/tour
+ *  launched against worktree A never opens while reviewing worktree B. Jobs
+ *  launched before this field existed, and jobs from providers that never set
+ *  `diffContext`, coalesce to the main tree (`null`) — deliberate, so old jobs
+ *  keep matching the common case instead of going permanently unmatchable.
+ *
+ *  DELIBERATELY matches by prUrl/worktreePath only — NOT diffScope/mode/base,
+ *  even though jobs carry them. Annotations scope by diffScope because they
+ *  pin exact line positions in a specific patch; guides/tours reference FILES
+ *  and degrade per-file ("no longer in the current diff") when the diff
+ *  shifts underneath them. Layer→full-stack is a superset (the artifact
+ *  fully resolves — hiding it would be hostile); full-stack→layer and local
+ *  base/mode switches degrade honestly. Scope-strict matching here would
+ *  vaporize a useful guide because the reviewer toggled since-base →
+ *  uncommitted. Do not "tighten" this without a UX decision. */
+export function jobMatchesReviewContext(
+  job: Pick<AgentJobInfo, 'prUrl' | 'diffContext'>,
+  currentPrUrl: string | undefined,
+  currentWorktreePath?: string | null,
+): boolean {
+  if (currentPrUrl) return job.prUrl === currentPrUrl;
+  if (job.prUrl) return false;
+  return (job.diffContext?.worktreePath ?? null) === (currentWorktreePath ?? null);
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;

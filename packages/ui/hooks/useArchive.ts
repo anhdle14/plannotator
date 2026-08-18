@@ -6,10 +6,11 @@
  */
 
 import { useState, useRef, useMemo, useCallback } from "react";
-import type { ArchivedPlan } from "@plannotator/shared/storage";
+import type { ArchivedPlan } from "@plannotator/core/storage-types";
 import type { UseLinkedDocReturn } from "./useLinkedDoc";
 import type { ViewerHandle } from "../components/Viewer";
 import type { Annotation } from "../types";
+import { copyTextToClipboard } from "../utils/clipboard";
 import { getPlanSaveSettings } from "../utils/planSave";
 
 export interface UseArchiveOptions {
@@ -148,7 +149,7 @@ export function useArchive(options: UseArchiveOptions): UseArchiveReturn {
   }, [setSubmitted]);
 
   const copy = useCallback(() => {
-    navigator.clipboard.writeText(markdown);
+    void copyTextToClipboard(markdown);
   }, [markdown]);
 
   const clearSelection = useCallback(() => {
