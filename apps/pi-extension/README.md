@@ -96,6 +96,27 @@ Approval never begins implementation directly. During grilling, Pi reads the app
 
 Print/JSON mode and missing browser assets fail closed. The fork never auto-approves or hands off an unreviewed plan. On resubmission, Plan Diff highlights what changed between versions.
 
+### Plan templates
+
+Start a plan from a template with `/plannotator <type> [intent]`, for example `/plannotator bug-investigation flaky gateway test`.
+Run `/plannotator` with no arguments to list the available templates and where each one comes from.
+
+The command writes the template to `tmp/plans/<YYYY-MM-DD>-<slug>.md`, enters planning, and asks the agent to fill that file in place and submit it.
+The slug comes from the intent, or from the template name when no intent is given.
+An existing plan file is never overwritten; the command adds `-2`, `-3`, and so on instead.
+The command refuses to start a new plan while a plan is in grilling, execution, or review.
+
+Built-in templates: `research-decision`, `bug-investigation`, `implementation`, `migration-rollout`, `refactor`, and `review`.
+Templates are Markdown files resolved in this order, where a later layer overrides a file with the same name:
+
+1. Built-in templates shipped in `templates/`.
+1. User templates in `~/.pi/agent/plannotator/templates/*.md` (or `$PI_CODING_AGENT_DIR/plannotator/templates/`).
+1. Project templates in `<cwd>/.pi/plannotator/templates/*.md`, loaded only when Pi trusts the project.
+
+The file name without `.md` is the template type.
+An optional `description:` front matter line provides the listing text and is removed from the scaffolded plan.
+Templates support `{{date}}`, `{{intent}}`, and `{{owner}}` (Git `user.name`, falling back to the OS user); unknown placeholders are left as-is and reported.
+
 ### Programmatic plan-mode control
 
 Other Pi extensions can enter, exit, toggle, or query Plannotator plan mode through the shared Pi event bus without invoking the `/plannotator-plan-mode` slash command:
@@ -281,6 +302,7 @@ During execution, the agent marks completed steps with `[DONE:n]` markers. Progr
 
 | Command | Description |
 |---------|-------------|
+| `/plannotator [<type> [intent]]` | List plan templates, or scaffold `tmp/plans/<date>-<slug>.md` from one and enter planning |
 | `/plannotator-plan-mode` | Toggle plan mode. Plans default to `tmp/plans/<slug>.md` and require browser review plus grilling |
 | `/plannotator-review` | Open code review UI for current changes |
 | `/plannotator-annotate <file>` | Open markdown file in annotation UI |
