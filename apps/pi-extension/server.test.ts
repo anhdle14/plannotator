@@ -76,7 +76,7 @@ function flattenTree(nodes: PiTreeNode[]): string[] {
 }
 
 function childEnv(): NodeJS.ProcessEnv {
-  return { ...process.env };
+  return { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
 }
 
 function git(cwd: string, args: string[]): string {

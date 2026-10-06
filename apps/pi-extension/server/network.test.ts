@@ -23,6 +23,10 @@ const envKeys = [
 	"PLANNOTATOR_URL_HOST",
 ];
 
+function listenerCounts(server: ReturnType<typeof createServer>) {
+	return { error: server.listenerCount("error"), listening: server.listenerCount("listening") };
+}
+
 function clearEnv() {
 	for (const key of envKeys) {
 		savedEnv[key] = process.env[key];
@@ -158,13 +162,13 @@ describe("pi port selection", () => {
 		await closeServer(servers[1]);
 		process.env.PLANNOTATOR_PORT = `${start}-${start + 1}`;
 		const server = createServer();
+		const baselineListeners = listenerCounts(server);
 		try {
 			expect(await listenOnPort(server)).toEqual({
 				port: start + 1,
 				portSource: "env",
 			});
-			expect(server.listenerCount("error")).toBe(0);
-			expect(server.listenerCount("listening")).toBe(0);
+						expect(listenerCounts(server)).toEqual(baselineListeners);
 		} finally {
 			await closeServer(server);
 			await closeServer(servers[0]);
@@ -206,11 +210,11 @@ describe("pi port selection", () => {
 		const { start, servers } = await occupyConsecutivePorts(12);
 		process.env.PLANNOTATOR_PORT = `${start}-${start + servers.length - 1}`;
 		const server = createServer();
+		const baselineListeners = listenerCounts(server);
 
 		try {
 			await expect(listenOnPort(server)).rejects.toThrow("exhausted");
-			expect(server.listenerCount("error")).toBe(0);
-			expect(server.listenerCount("listening")).toBe(0);
+						expect(listenerCounts(server)).toEqual(baselineListeners);
 		} finally {
 			await Promise.all(servers.map(closeServer));
 		}
@@ -223,13 +227,13 @@ describe("pi non-range port compatibility", () => {
 		const { start, servers } = await occupyConsecutivePorts(1);
 		process.env.PLANNOTATOR_PORT = String(start);
 		const server = createServer();
+		const baselineListeners = listenerCounts(server);
 
 		try {
 			await expect(listenOnPort(server)).rejects.toThrow(
 				new RegExp(`^Port ${start} in use after 5 retries$`),
 			);
-			expect(server.listenerCount("error")).toBe(0);
-			expect(server.listenerCount("listening")).toBe(0);
+						expect(listenerCounts(server)).toEqual(baselineListeners);
 		} finally {
 			await closeServer(servers[0]);
 		}
