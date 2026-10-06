@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import plannotator from "./index.ts";
+import { isolateAgentDir } from "./test-setup/agent-dir.ts";
 import { hashPlanContent } from "./grill.ts";
 import { PLANNOTATOR_PLAN_APPROVED_CHANNEL } from "./plannotator-events.ts";
 
@@ -14,6 +15,8 @@ function makeTempDir(prefix: string): string {
 	tempDirs.push(dir);
 	return dir;
 }
+
+isolateAgentDir();
 
 afterEach(() => {
 	for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });

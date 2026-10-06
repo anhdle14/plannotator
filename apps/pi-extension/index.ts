@@ -24,7 +24,24 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Key } from "@earendil-works/pi-tui";
-import { buildPromptVariables, formatTodoList, loadPlannotatorConfig, renderTemplate, resolveExecutionMode, resolvePhaseProfile } from "./config.ts";
+import { buildPromptVariables, formatTodoList, loadPlannotatorConfig, renderTemplate, resolveExecutionMode, resolveModelRouting, resolvePhaseProfile } from "./config.ts";
+import {
+	applyModelLines,
+	chooseReviewer,
+	classifyPhases,
+	copyModelUsage,
+	countWrittenLines,
+	currentPhaseIndex,
+	emptyModelUsage,
+	formatModelLine,
+	type ModelUsage,
+	parsePlanPhases,
+	releaseTierLock,
+	requestTierLock,
+	resolvePlanTarget,
+	reviewerInstruction,
+	writePlanIfUnchanged,
+} from "./model-routing.ts";
 import {
 	type ChecklistItem,
 	markCompletedSteps,
@@ -138,6 +155,7 @@ type PersistedPlannotatorState = {
 	grillSummary?: string;
 	/** Whether the current phase's entry framing message was already delivered. */
 	framingDelivered?: boolean;
+	modelUsage?: ModelUsage;
 };
 
 function getPlanReviewAvailabilityWarning(options: { hasUI: boolean; hasPlanHtml: boolean }): string | null {
@@ -310,6 +328,16 @@ export default function plannotator(pi: ExtensionAPI): void {
 	let todoProvider: TodoProvider | undefined;
 	/** Latch: no provider found, or one sync failed. Cleared on return to idle. */
 	let todoProviderDisabled = false;
+	let modelUsage: ModelUsage = emptyModelUsage();
+	/** Tier the current phase wants Bifrost to hold; undefined means no lock. */
+	let lockTarget: string | undefined;
+	/** Tier Bifrost acknowledged for plannotator. */
+	let lockHeld: string | undefined;
+	/** True from a lock request until its release, so a late or unacknowledged acquisition is still released. */
+	let lockMaybeHeld = false;
+	/** Tier whose last request failed; execution does not retry it until the target changes. */
+	let lockRefused: string | undefined;
+	let lockQueue: Promise<unknown> = Promise.resolve();
 
 	pi.on("session_start", (_event, ctx) => {
 		sessionAlive = true;
@@ -319,6 +347,8 @@ export default function plannotator(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", () => {
 		sessionAlive = false;
 		currentPiSession.clear();
+		lockTarget = undefined;
+		void enqueueLockReconcile(false);
 		// Browser sessions deliberately outlive in-process session replacement so
 		// a tab opened before /new can still deliver feedback to the replacement
 		// session (withCurrentPiSessionFallbackHeader). On real process teardown
@@ -425,13 +455,100 @@ export default function plannotator(pi: ExtensionAPI): void {
 			approvalFeedback,
 			grillSummary,
 			framingDelivered,
+			modelUsage: copyModelUsage(modelUsage),
 		});
 	}
 
-	async function refreshPhaseUi(ctx: ExtensionContext): Promise<void> {
+	function modelKeyOf(ctx: ExtensionContext): string | undefined {
+		const model = ctx.model as { provider?: string; id?: string } | undefined;
+		return model?.provider && model.id ? `${model.provider}/${model.id}` : undefined;
+	}
+
+	function readActivePlan(ctx: ExtensionContext): string | undefined {
+		if (!lastSubmittedPath) return undefined;
+		try {
+			return readFileSync(resolve(ctx.cwd, lastSubmittedPath), "utf-8");
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** Re-read the plan's checklist from disk, keeping steps already reported with [DONE:n]. */
+	function refreshChecklistFromDisk(ctx: ExtensionContext): void {
+		const plan = readActivePlan(ctx);
+		if (plan === undefined) return;
+		const done = new Set(checklistItems.filter((item) => item.completed).map((item) => `${item.step}\n${item.text}`));
+		checklistItems = parseChecklist(plan).map((item) => (done.has(`${item.step}\n${item.text}`) ? { ...item, completed: true } : item));
+	}
+
+	function desiredTier(ctx: ExtensionContext): string | undefined {
+		const settings = resolveModelRouting(plannotatorConfig);
+		if (phase === "planning" || phase === "grilling") return settings.planningTier;
+		if (phase !== "executing") return undefined;
+		const plan = readActivePlan(ctx);
+		if (!plan) return undefined;
+		const phases = parsePlanPhases(plan, settings.phaseTiers);
+		const completed = new Set(checklistItems.filter((item) => item.completed).map((item) => item.step));
+		return phases[currentPhaseIndex(plan, phases, completed)]?.assignedTier;
+	}
+
+	type LockFailure = { tier: string; reason: string };
+
+	/** Serialize lock work so Bifrost always ends up holding the latest lockTarget, or nothing. */
+	function enqueueLockReconcile(revalidate: boolean): Promise<LockFailure | undefined> {
+		const run = lockQueue.then(() => reconcileLock(revalidate));
+		lockQueue = run.catch(() => undefined);
+		return run;
+	}
+
+	async function reconcileLock(revalidate: boolean): Promise<LockFailure | undefined> {
+		const wanted = lockTarget;
+		if (!wanted) {
+			if (lockMaybeHeld) releaseTierLock(pi.events);
+			lockMaybeHeld = false;
+			lockHeld = undefined;
+			lockRefused = undefined;
+			return undefined;
+		}
+		if (!revalidate && (wanted === lockHeld || wanted === lockRefused)) return undefined;
+		lockMaybeHeld = true;
+		const result = await requestTierLock(pi.events, wanted, {
+			onLateReply: () => {
+				lockMaybeHeld = true;
+				void enqueueLockReconcile(true);
+			},
+		});
+		if (result.ok) {
+			lockHeld = wanted;
+			lockRefused = undefined;
+			return undefined;
+		}
+		releaseTierLock(pi.events);
+		lockMaybeHeld = false;
+		lockHeld = undefined;
+		lockRefused = wanted;
+		return { tier: wanted, reason: result.reason };
+	}
+
+	/** Point Bifrost's lock at the tier the current phase needs. Planning revalidates on every call; execution on change. */
+	async function syncModelLock(ctx: ExtensionContext): Promise<LockFailure | undefined> {
+		lockTarget = resolveModelRouting(plannotatorConfig).enabled ? desiredTier(ctx) : undefined;
+		const failure = await enqueueLockReconcile(phase === "planning" || phase === "grilling");
+		if (failure && phase === "executing" && sessionAlive) {
+			ctx.ui.notify(`Plannotator: could not hold the ${failure.tier} tier for this phase (${failure.reason}); Bifrost routes normally.`, "warning");
+		}
+		return failure;
+	}
+
+	async function refreshPhaseUi(ctx: ExtensionContext): Promise<LockFailure | undefined> {
 		updateStatus(ctx);
 		updateWidget(ctx);
 		await syncTodoProvider(ctx);
+		return syncModelLock(ctx);
+	}
+
+	function planningLockMessage(failure: LockFailure): string {
+		return `Plannotator: ${phase} runs only on the ${failure.tier} tier, and Bifrost could not hold it: ${failure.reason}. Prompts are not sent until it can; exit with /plannotator-plan-mode to work without plan mode.`;
 	}
 
 	async function enterPlanning(ctx: ExtensionContext): Promise<void> {
@@ -442,9 +559,11 @@ export default function plannotator(pi: ExtensionAPI): void {
 		approvalFeedback = undefined;
 		grillSummary = undefined;
 		checklistItems = [];
-		await refreshPhaseUi(ctx);
+		modelUsage = emptyModelUsage();
+		const lockFailure = await refreshPhaseUi(ctx);
 		persistState();
 		ctx.ui.notify("Plannotator: planning mode enabled.");
+		if (lockFailure) ctx.ui.notify(planningLockMessage(lockFailure), "error");
 		const warning = getPlanReviewAvailabilityWarning({ hasUI: ctx.hasUI, hasPlanHtml: hasPlanBrowserHtml() });
 		if (warning) ctx.ui.notify(warning, "warning");
 	}
@@ -459,6 +578,7 @@ export default function plannotator(pi: ExtensionAPI): void {
 		grillSummary = undefined;
 		todoProvider = undefined;
 		todoProviderDisabled = false;
+		modelUsage = emptyModelUsage();
 		await refreshPhaseUi(ctx);
 		persistState();
 	}
@@ -1124,6 +1244,14 @@ export default function plannotator(pi: ExtensionAPI): void {
 				};
 			}
 
+			const routed = await routePlanPhases(ctx, fullPath, planContent, signal);
+			if (!routed.ok) {
+				return {
+					content: [{ type: "text", text: `Error: ${routed.error}. The plan was not submitted for review.` }],
+					details: { approved: false },
+				};
+			}
+			planContent = routed.content;
 			lastSubmittedPath = inputPath;
 			checklistItems = parseChecklist(planContent);
 
@@ -1210,6 +1338,54 @@ export default function plannotator(pi: ExtensionAPI): void {
 			};
 		},
 	});
+
+	/** Write a System One tier into every phase without a decided `- Model:` line, before review shows the plan. */
+	async function routePlanPhases(
+		ctx: ExtensionContext,
+		fullPath: string,
+		planContent: string,
+		signal: AbortSignal | undefined,
+	): Promise<{ ok: true; content: string } | { ok: false; error: string }> {
+		const settings = resolveModelRouting(plannotatorConfig);
+		if (!settings.enabled) return { ok: true, content: planContent };
+		const phases = parsePlanPhases(planContent, settings.phaseTiers);
+		const targets = phases
+			.map((planPhase, index) => ({ planPhase, index }))
+			.filter(({ planPhase }) => !planPhase.assignedTier && !planPhase.undecided);
+		if (targets.length === 0) return { ok: true, content: planContent };
+		const location = resolvePlanTarget(ctx.cwd, fullPath);
+		if ("error" in location) return { ok: false, error: `cannot write phase tiers into the plan: ${location.error}` };
+		let judgments: Awaited<ReturnType<typeof classifyPhases>>;
+		try {
+			judgments = await classifyPhases({
+				phases: targets.map(({ planPhase }) => planPhase),
+				settings,
+				signal,
+			});
+		} catch {
+			return { ok: false, error: "plan submission was cancelled while System One was judging phase tiers" };
+		}
+		if (signal?.aborted || !sessionAlive) {
+			return { ok: false, error: "plan submission was cancelled while System One was judging phase tiers" };
+		}
+		const lines = new Map<number, string>();
+		const summary: string[] = [];
+		let unavailable: string | undefined;
+		targets.forEach(({ planPhase, index }, position) => {
+			const judgment = judgments[position];
+			lines.set(index, formatModelLine(judgment, settings.planningTier));
+			if (judgment.kind === "unavailable") unavailable = judgment.reason;
+			else summary.push(`${planPhase.title}: ${judgment.kind === "assigned" ? judgment.tier : `undecided (${judgment.tier}?)`} p=${judgment.probability.toFixed(2)}`);
+		});
+		const updated = applyModelLines(planContent, phases, lines);
+		const writeError = writePlanIfUnchanged(ctx.cwd, fullPath, planContent, updated);
+		if (writeError) return { ok: false, error: `cannot write phase tiers into the plan: ${writeError}` };
+		if (unavailable) {
+			ctx.ui.notify(`Plannotator: ${unavailable}. Phases without a judgment were set to ${settings.planningTier}.`, "warning");
+		}
+		if (summary.length > 0) ctx.ui.notify(`Plannotator phase tiers (System One):\n${summary.join("\n")}`, "info");
+		return { ok: true, content: updated };
+	}
 
 	pi.registerTool({
 		name: GRILL_FINISH_TOOL,
@@ -1304,8 +1480,29 @@ export default function plannotator(pi: ExtensionAPI): void {
 
 	// ── Event Handlers ───────────────────────────────────────────────────
 
+	// Planning and grilling run only on the planning tier, revalidated per prompt; execution advances the lock first.
+	pi.on("input", async (event, ctx) => {
+		if (!resolveModelRouting(plannotatorConfig).enabled || event.text.trimStart().startsWith("/")) return;
+		if (phase === "executing") {
+			refreshChecklistFromDisk(ctx);
+			await syncModelLock(ctx);
+			return;
+		}
+		if (phase !== "planning" && phase !== "grilling") return;
+		const failure = await syncModelLock(ctx);
+		if (!failure) return;
+		ctx.ui.notify(planningLockMessage(failure), "error");
+		return { action: "handled" };
+	});
+
 	// Keep implementation locked during planning and grilling without disabling Pi tools.
 	pi.on("tool_call", async (event, ctx) => {
+		if (phase === "executing" && resolveModelRouting(plannotatorConfig).enabled && getFileMutationPath(event.toolName, event.input)) {
+			const model = modelKeyOf(ctx);
+			const lines = countWrittenLines(event.input);
+			if (model && lines > 0) modelUsage.builders[model] = (modelUsage.builders[model] ?? 0) + lines;
+			return;
+		}
 		if (!isPreImplementationPhase(phase)) return;
 		const inputPath = getFileMutationPath(event.toolName, event.input);
 		if (!inputPath || isPlanWritePathAllowed(inputPath, ctx.cwd)) return;
@@ -1323,19 +1520,20 @@ export default function plannotator(pi: ExtensionAPI): void {
 	// (#922, approach suggested by Karrq).
 	pi.on("before_agent_start", async (_event, ctx) => {
 		if (phase !== "planning" && phase !== "grilling" && phase !== "executing") return;
+		const routing = resolveModelRouting(plannotatorConfig);
+		if (routing.enabled && (phase === "planning" || phase === "grilling")) {
+			const model = modelKeyOf(ctx);
+			if (model) modelUsage.planners[model] = (modelUsage.planners[model] ?? 0) + 1;
+		}
+		const reviewerLine = routing.enabled && phase === "executing"
+			? reviewerInstruction(chooseReviewer(modelUsage, routing.reviewers))
+			: undefined;
 
 		const profile = getPhaseProfile();
 		const planRef = lastSubmittedPath ?? "your plan file";
 
 		if (phase === "executing" && lastSubmittedPath) {
-			// Re-read from disk each turn to stay current
-			const fullPath = resolve(ctx.cwd, lastSubmittedPath);
-			try {
-				const planContent = readFileSync(fullPath, "utf-8");
-				checklistItems = parseChecklist(planContent);
-			} catch {
-				// File deleted during execution — degrade gracefully
-			}
+			refreshChecklistFromDisk(ctx);
 		}
 
 		const todoStats = phase === "executing" ? formatTodoList(checklistItems) : formatTodoList([]);
@@ -1352,16 +1550,17 @@ ${todoStats.todoList}
 
 Mark completed steps with [DONE:n] in your response.`
 				: null;
+		const todoMessage = todoStatus && reviewerLine ? `${todoStatus}\n\n${reviewerLine}` : todoStatus;
 
 		if (framingDelivered) {
 			// Same phase, later prompt: the framing already sits in conversation
 			// history, so inject nothing beyond the small todo snapshot during
 			// execution.
-			if (!todoStatus) return;
+			if (!todoMessage) return;
 			return {
 				message: {
 					customType: "plannotator-context",
-					content: todoStatus,
+					content: todoMessage,
 					display: false,
 				},
 			};
@@ -1373,11 +1572,11 @@ Mark completed steps with [DONE:n] in your response.`
 		if (!profile?.instructions) {
 			// Framing explicitly disabled (instructions null/empty): deliver only
 			// the todo snapshot during execution, nothing during planning.
-			if (!todoStatus) return;
+			if (!todoMessage) return;
 			return {
 				message: {
 					customType: "plannotator-context",
-					content: todoStatus,
+					content: todoMessage,
 					display: false,
 				},
 			};
@@ -1405,6 +1604,13 @@ Mark completed steps with [DONE:n] in your response.`
 		if (phase === "grilling" && approvalFeedback) {
 			content += `\n\nBrowser approval notes:\n${approvalFeedback}`;
 		}
+		if (phase === "grilling" && routing.enabled) {
+			const plan = readActivePlan(ctx);
+			const undecided = plan ? parsePlanPhases(plan, routing.phaseTiers).filter((planPhase) => planPhase.undecided) : [];
+			if (undecided.length > 0) {
+				content += `\n\nSystem One was not confident about the model tier for: ${undecided.map((planPhase) => planPhase.title).join("; ")}. Ask the user to choose ${routing.phaseTiers.join(", ")} for each, recommending System One's suggestion from the phase's Model line, and record the answer as \`- Model: <tier> (grill decision)\`.`;
+			}
+		}
 		if (phase === "planning") {
 			const hook = readImprovementHook("enterplanmode-improve");
 			const pfmEnabled = loadConfig().pfmReminder === true;
@@ -1420,6 +1626,7 @@ Mark completed steps with [DONE:n] in your response.`
 		if (todoStatus && !profile.instructions.includes("${todoList}")) {
 			content += "\n\n" + todoStatus;
 		}
+		if (reviewerLine) content += `\n\n${reviewerLine}`;
 
 		return {
 			message: {
@@ -1488,6 +1695,10 @@ Mark completed steps with [DONE:n] in your response.`
 
 	// Track execution progress
 	pi.on("turn_end", async (event, ctx) => {
+		if ((phase === "planning" || phase === "grilling") && resolveModelRouting(plannotatorConfig).enabled) {
+			persistState();
+			return;
+		}
 		if (phase !== "executing" || checklistItems.length === 0) return;
 
 		const text = getAssistantMessageText(event.message);
@@ -1496,6 +1707,7 @@ Mark completed steps with [DONE:n] in your response.`
 			updateStatus(ctx);
 			updateWidget(ctx);
 			await syncTodoProvider(ctx);
+			await syncModelLock(ctx);
 		}
 		persistState();
 	});
@@ -1585,6 +1797,7 @@ Mark completed steps with [DONE:n] in your response.`
 			approvalFeedback = stateEntry.data.approvalFeedback;
 			grillSummary = stateEntry.data.grillSummary;
 			framingDelivered = stateEntry.data.framingDelivered ?? false;
+			modelUsage = copyModelUsage(stateEntry.data.modelUsage);
 			if (phase === "grilling" && !framingDelivered) justEnteredGrill = true;
 		} else {
 			phase = options.phaseWhenUnrecorded;
@@ -1593,6 +1806,7 @@ Mark completed steps with [DONE:n] in your response.`
 			approvalFeedback = undefined;
 			grillSummary = undefined;
 			framingDelivered = false;
+			modelUsage = emptyModelUsage();
 		}
 
 		// Rebuild active plan state from disk and execution messages.

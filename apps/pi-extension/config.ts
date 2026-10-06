@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { DEFAULT_MODEL_ROUTING, type ModelRoutingSettings, TIER_NAME } from "./model-routing.ts";
 
 export type PhaseName = "planning" | "grilling" | "executing" | "reviewing";
 export type RuntimePhase = PhaseName | "idle";
@@ -23,10 +24,23 @@ export interface PhaseProfile {
   instructions?: string | null;
 }
 
+export interface ModelRoutingConfig {
+  enabled?: boolean;
+  planningTier?: string;
+  phaseTiers?: string[];
+  systemOneUrl?: string;
+  systemOneModel?: string;
+  minProbability?: number;
+  timeoutMs?: number;
+  reviewers?: { anthropic?: string; openai?: string };
+  criteria?: Record<string, string>;
+}
+
 export interface PlannotatorConfig {
   executionMode?: ExecutionMode | null;
   defaults?: PhaseProfile | null;
   phases?: Partial<Record<PhaseName, PhaseProfile | null>>;
+  modelRouting?: ModelRoutingConfig;
 }
 
 export interface LoadedPlannotatorConfig {
@@ -135,7 +149,100 @@ function mergeConfig(base: PlannotatorConfig, override: PlannotatorConfig): Plan
     executionMode: override.executionMode !== undefined ? override.executionMode : base.executionMode,
     defaults: mergeProfile(base.defaults, override.defaults),
     phases: Object.keys(phases).length > 0 ? phases : undefined,
+    modelRouting: mergeModelRouting(base.modelRouting, override.modelRouting),
   };
+}
+
+function mergeModelRouting(base: ModelRoutingConfig | undefined, override: ModelRoutingConfig | undefined): ModelRoutingConfig | undefined {
+  if (!base) return override;
+  if (!override) return base;
+  return {
+    ...base,
+    ...override,
+    reviewers: base.reviewers || override.reviewers ? { ...base.reviewers, ...override.reviewers } : undefined,
+    criteria: base.criteria || override.criteria ? { ...base.criteria, ...override.criteria } : undefined,
+  };
+}
+
+const MAX_TIMER_MS = 2_147_483_647;
+
+function normalizeModelRouting(raw: unknown, path: string, warnings: string[]): ModelRoutingConfig | undefined {
+  if (raw === undefined) return undefined;
+  if (!isRecord(raw)) {
+    warnings.push(`Ignoring modelRouting in ${path}: expected an object.`);
+    return undefined;
+  }
+  const config: ModelRoutingConfig = {};
+  const reject = (key: string, expected: string) => warnings.push(`Ignoring modelRouting.${key} in ${path}: expected ${expected}.`);
+  const nonEmpty = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
+  const tierName = (value: unknown): value is string => typeof value === "string" && TIER_NAME.test(value) && value !== "undecided";
+  const tierExpectation = 'a tier name of letters, digits, "_" or "-" starting with a letter, other than "undecided"';
+
+  if (raw.enabled !== undefined) {
+    if (typeof raw.enabled === "boolean") config.enabled = raw.enabled;
+    else reject("enabled", "true or false");
+  }
+  if (raw.planningTier !== undefined) {
+    if (tierName(raw.planningTier)) config.planningTier = raw.planningTier;
+    else reject("planningTier", tierExpectation);
+  }
+  if (raw.phaseTiers !== undefined) {
+    const tiers = raw.phaseTiers;
+    if (Array.isArray(tiers) && tiers.length >= 2 && tiers.every(tierName) && new Set(tiers).size === tiers.length) config.phaseTiers = tiers;
+    else reject("phaseTiers", `at least two unique tier names, each ${tierExpectation}`);
+  }
+  if (raw.systemOneUrl !== undefined) {
+    if (isHttpUrl(raw.systemOneUrl)) config.systemOneUrl = raw.systemOneUrl;
+    else reject("systemOneUrl", "an http:// or https:// URL");
+  }
+  if (raw.systemOneModel !== undefined) {
+    if (nonEmpty(raw.systemOneModel)) config.systemOneModel = raw.systemOneModel.trim();
+    else reject("systemOneModel", "a non-empty string");
+  }
+  if (raw.minProbability !== undefined) {
+    if (typeof raw.minProbability === "number" && raw.minProbability >= 0 && raw.minProbability <= 1) config.minProbability = raw.minProbability;
+    else reject("minProbability", "a number from 0 to 1");
+  }
+  if (raw.timeoutMs !== undefined) {
+    if (Number.isInteger(raw.timeoutMs) && (raw.timeoutMs as number) > 0 && (raw.timeoutMs as number) <= MAX_TIMER_MS) config.timeoutMs = raw.timeoutMs as number;
+    else reject("timeoutMs", `a whole number of milliseconds from 1 to ${MAX_TIMER_MS}`);
+  }
+  if (raw.reviewers !== undefined) {
+    if (!isRecord(raw.reviewers)) reject("reviewers", "an object with anthropic and openai model keys");
+    else {
+      const reviewers: ModelRoutingConfig["reviewers"] = {};
+      for (const [vendor, model] of Object.entries(raw.reviewers)) {
+        if ((vendor === "anthropic" || vendor === "openai") && nonEmpty(model)) reviewers[vendor] = model.trim();
+        else reject(`reviewers.${vendor}`, 'a non-empty model key under "anthropic" or "openai"');
+      }
+      if (Object.keys(reviewers).length > 0) config.reviewers = reviewers;
+    }
+  }
+  if (raw.criteria !== undefined) {
+    if (!isRecord(raw.criteria)) reject("criteria", "an object of tier descriptions");
+    else {
+      const criteria: Record<string, string> = {};
+      for (const [tier, description] of Object.entries(raw.criteria)) {
+        if (nonEmpty(description)) criteria[tier] = description;
+        else reject(`criteria.${tier}`, "a non-empty description");
+      }
+      if (Object.keys(criteria).length > 0) config.criteria = criteria;
+    }
+  }
+  const known = new Set(["enabled", "planningTier", "phaseTiers", "systemOneUrl", "systemOneModel", "minProbability", "timeoutMs", "reviewers", "criteria"]);
+  const unknown = Object.keys(raw).filter((key) => !known.has(key));
+  if (unknown.length > 0) warnings.push(`Ignoring unknown modelRouting keys in ${path}: ${unknown.join(", ")}.`);
+  return config;
+}
+
+function isHttpUrl(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 function loadConfigSource(path: string): { config: PlannotatorConfig; warnings: string[] } {
@@ -159,6 +266,8 @@ function loadConfigSource(path: string): { config: PlannotatorConfig; warnings: 
     );
   }
   if ("defaults" in raw) config.defaults = normalizeProfile(raw.defaults);
+  const modelRouting = normalizeModelRouting(raw.modelRouting, path, warnings);
+  if (modelRouting) config.modelRouting = modelRouting;
 
   if ("phases" in raw && isRecord(raw.phases)) {
     const phases: Partial<Record<PhaseName, PhaseProfile | null>> = {};
@@ -243,6 +352,25 @@ export function loadPlannotatorConfig(
 
 export function resolveExecutionMode(config: PlannotatorConfig): ExecutionMode {
   return config.executionMode ?? "automatic";
+}
+
+export function resolveModelRouting(config: PlannotatorConfig): ModelRoutingSettings {
+  const raw = config.modelRouting ?? {};
+  const defaults = DEFAULT_MODEL_ROUTING;
+  return {
+    enabled: raw.enabled ?? defaults.enabled,
+    planningTier: raw.planningTier ?? defaults.planningTier,
+    phaseTiers: raw.phaseTiers ?? defaults.phaseTiers,
+    systemOneUrl: raw.systemOneUrl ?? process.env.SYSTEM_ONE_BASE_URL ?? defaults.systemOneUrl,
+    systemOneModel: raw.systemOneModel ?? defaults.systemOneModel,
+    minProbability: raw.minProbability ?? defaults.minProbability,
+    timeoutMs: raw.timeoutMs ?? defaults.timeoutMs,
+    reviewers: {
+      anthropic: raw.reviewers?.anthropic ?? defaults.reviewers.anthropic,
+      openai: raw.reviewers?.openai ?? defaults.reviewers.openai,
+    },
+    criteria: { ...defaults.criteria, ...raw.criteria },
+  };
 }
 
 export function resolvePhaseProfile(config: PlannotatorConfig, phase: PhaseName): ResolvedPhaseProfile {

@@ -38,6 +38,7 @@
     "server.ts",
     "tool-scope.ts",
     "grill.ts",
+    "model-routing.ts",
     "config.ts",
     "plan-templates.ts",
     "templates/",

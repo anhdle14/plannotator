@@ -6,7 +6,7 @@ owner: {{owner}}
 created: {{date}}
 builder: <implementer>
 validator: <reviewer>
-models: plan=<frontier>; build=<fast>; review=<second model>
+models: plan=frontier; build=per phase (- Model: lines); review=cross-vendor
 ---
 # {{intent}}
 ## Goal and acceptance

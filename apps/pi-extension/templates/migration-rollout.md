@@ -6,6 +6,7 @@ owner: {{owner}}
 created: {{date}}
 builder: <operator>
 validator: <safety reviewer>
+models: plan=frontier; build=per phase (- Model: lines); review=cross-vendor
 ---
 # {{intent}}
 ## Target and guardrails

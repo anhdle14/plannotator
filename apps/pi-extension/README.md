@@ -217,6 +217,49 @@ Use these inside `instructions` strings. They render once, when the phase is ent
 - Global user override: `~/.pi/agent/plannotator.json`
 - Project-local override: `<cwd>/.pi/plannotator.json`
 
+### Model routing
+
+Plannotator can route each plan phase to a model tier without choosing models itself.
+It needs a Pi-Bifrost build that answers the `bifrost:lock` and `bifrost:release` events, and a System One server (`POST /v1/systemone`).
+Routing is off by default; enable it with `modelRouting` in any config layer:
+
+```json
+{
+  "modelRouting": {
+    "enabled": true,
+    "planningTier": "frontier",
+    "phaseTiers": ["quick", "general", "frontier"],
+    "systemOneUrl": "http://127.0.0.1:8008",
+    "systemOneModel": "von-latest",
+    "minProbability": 0.6,
+    "reviewers": {
+      "anthropic": "wovey/gpt-6.1-sol",
+      "openai": "wovey/global.anthropic.claude-opus-5-5"
+    }
+  }
+}
+```
+
+- Planning and grilling hold Bifrost on `planningTier`, and Plannotator asks Bifrost again before every prompt, so turning Bifrost routing off or pinning the session takes effect at once.
+  If Bifrost cannot hold that tier, prompts are not sent and Plannotator shows the reason; exit plan mode to work without it.
+- On submit, every `## Phase` to `#### Phase` section without a decided `- Model:` line gets one System One `score` question over that phase's own text; requests are sent one at a time.
+  A Phase heading at any of those depths ends the previous phase, so a nested `### Phase 1.1` is its own phase.
+  The answer is written into the plan as `- Model: <tier> (System One p=<x>)`, so the browser review shows it and you can edit it.
+  Answers whose top tier probability is below `minProbability` become `- Model: undecided (...)` and the grill asks you to choose.
+  An answer that does not give every tier a probability in [0, 1], summing to 1, counts as unreachable.
+  If System One is unreachable, phases get `planningTier` with an explicit note.
+  The plan is rewritten only if it still matches what was judged and still resolves inside the working directory; otherwise, or if you cancel, the submission fails and you resubmit.
+  Delete a phase's Model line to have it judged again on the next submit.
+- During execution, Plannotator locks the tier of the phase that holds the first open checklist step, and moves the lock when steps are marked `[DONE:n]` or ticked in the plan file; Bifrost still picks the model, filters unhealthy routes, and fails over.
+  Lock failures during execution only warn, and Bifrost routes normally.
+  A lock that Bifrost grants after Plannotator stopped waiting for it, or after plan mode ended, is released.
+- Cross-vendor review: Plannotator counts planning turns and changed lines written per model.
+  The execution prompt tells the agent to delegate review with an explicit `acp_delegate` model from the other vendor: `reviewers.anthropic` reviews Anthropic-written work, and `reviewers.openai` reviews OpenAI-written work.
+  When both vendors wrote code, the vendor with fewer changed lines reviews, and the prompt flags it for confirmation.
+- `criteria` overrides the tier descriptions sent to System One, keyed by tier name.
+- Tier names use letters, digits, `_`, or `-`, start with a letter, and must be unique; `timeoutMs` is a whole number of milliseconds; an invalid field is ignored with a warning that names it.
+- `systemOneUrl` falls back to `SYSTEM_ONE_BASE_URL`, then loopback port 8008.
+
 ### Code review
 
 Run `/plannotator-review` to open your current VCS changes in the code review UI. Annotate specific lines, switch between the modes supported by the detected Git, GitButler, or JJ provider, and submit feedback that gets sent to the agent. Pass `--git` or `--gitbutler` to force that provider; GitButler requires `but` 0.21.0 or newer on `PATH`.

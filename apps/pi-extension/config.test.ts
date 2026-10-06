@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildPromptVariables, loadPlannotatorConfig, formatTodoList, renderTemplate, resolveExecutionMode, resolvePhaseProfile } from "./config.ts";
+import { buildPromptVariables, loadPlannotatorConfig, formatTodoList, renderTemplate, resolveExecutionMode, resolveModelRouting, resolvePhaseProfile } from "./config.ts";
 
 const tempDirs: string[] = [];
 const originalHome = process.env.HOME;
@@ -43,6 +43,63 @@ describe("plannotator config", () => {
 
   test("defaults to automatic execution", () => {
     expect(resolveExecutionMode({})).toBe("automatic");
+  });
+
+  test("model routing is off by default and merges global and project fields", () => {
+    expect(resolveModelRouting({}).enabled).toBe(false);
+
+    const homeDir = makeTempDir("plannotator-config-home-routing-");
+    const cwdDir = makeTempDir("plannotator-config-cwd-routing-");
+    process.env.HOME = homeDir;
+    mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+    mkdirSync(join(cwdDir, ".pi"), { recursive: true });
+    writeFileSync(join(homeDir, ".pi", "agent", "plannotator.json"), JSON.stringify({
+      modelRouting: { enabled: true, minProbability: 0.7, reviewers: { openai: "x/opus" }, criteria: { quick: "tiny" }, bogus: 1 },
+    }), "utf-8");
+    writeFileSync(join(cwdDir, ".pi", "plannotator.json"), JSON.stringify({
+      modelRouting: { planningTier: "general", reviewers: { anthropic: "x/sol" } },
+    }), "utf-8");
+
+    const loaded = loadPlannotatorConfig(cwdDir, { projectTrusted: true });
+    const routing = resolveModelRouting(loaded.config);
+
+    expect(loaded.warnings.some((warning) => warning.includes("bogus"))).toBe(true);
+    expect(routing.enabled).toBe(true);
+    expect(routing.minProbability).toBe(0.7);
+    expect(routing.planningTier).toBe("general");
+    expect(routing.reviewers).toEqual({ anthropic: "x/sol", openai: "x/opus" });
+    expect(routing.criteria.quick).toBe("tiny");
+    expect(routing.criteria.frontier).toContain("architecture");
+  });
+
+  test("model routing rejects invalid known fields with field-specific warnings", () => {
+    const cwdDir = makeTempDir("plannotator-config-cwd-routing-invalid-");
+    process.env.HOME = makeTempDir("plannotator-config-home-routing-invalid-");
+    mkdirSync(join(cwdDir, ".pi"), { recursive: true });
+    writeFileSync(join(cwdDir, ".pi", "plannotator.json"), JSON.stringify({
+      modelRouting: {
+        enabled: "yes",
+        planningTier: "undecided",
+        phaseTiers: ["quick", "quick", "two words"],
+        systemOneUrl: "ftp://judge",
+        minProbability: "0.7",
+        timeoutMs: 2_147_483_648,
+        reviewers: { google: "x/gemini" },
+        criteria: { quick: "" },
+      },
+    }), "utf-8");
+
+    const loaded = loadPlannotatorConfig(cwdDir, { projectTrusted: true });
+    for (const key of ["enabled", "planningTier", "phaseTiers", "systemOneUrl", "minProbability", "timeoutMs", "reviewers.google", "criteria.quick"]) {
+      expect(loaded.warnings.some((warning) => warning.startsWith(`Ignoring modelRouting.${key} in `))).toBe(true);
+    }
+    expect(loaded.config.modelRouting).toEqual({});
+    expect(resolveModelRouting(loaded.config)).toMatchObject({ enabled: false, planningTier: "frontier", minProbability: 0.6, timeoutMs: 30_000 });
+
+    writeFileSync(join(cwdDir, ".pi", "plannotator.json"), JSON.stringify({ modelRouting: { timeoutMs: 1.5 } }), "utf-8");
+    expect(loadPlannotatorConfig(cwdDir, { projectTrusted: true }).warnings).toEqual([
+      expect.stringContaining("modelRouting.timeoutMs"),
+    ]);
   });
 
   test("loads external execution mode with project precedence", () => {
