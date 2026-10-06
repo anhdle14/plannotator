@@ -258,7 +258,8 @@ Routing is off by default; enable it with `modelRouting` in any config layer:
   When both vendors wrote code, the vendor with fewer changed lines reviews, and the prompt flags it for confirmation.
 - `criteria` overrides the tier descriptions sent to System One, keyed by tier name.
 - Tier names use letters, digits, `_`, or `-`, start with a letter, and must be unique; `timeoutMs` is a whole number of milliseconds; an invalid field is ignored with a warning that names it.
-- `systemOneUrl` falls back to `SYSTEM_ONE_BASE_URL`, then loopback port 8008.
+- `planningTier` must be one of `phaseTiers`; otherwise Plannotator warns and turns routing off.
+- `systemOneUrl` falls back to `SYSTEM_ONE_BASE_URL` when that is an http(s) URL, then loopback port 8008.
 
 ### Code review
 

@@ -347,6 +347,17 @@ export function loadPlannotatorConfig(
   warnings.push(...projectConfig.warnings);
 
   const merged = mergeConfig(mergeConfig(internal.config, globalConfig.config), projectConfig.config);
+  const envUrl = process.env.SYSTEM_ONE_BASE_URL;
+  if (envUrl !== undefined && !isHttpUrl(envUrl)) {
+    warnings.push("Ignoring SYSTEM_ONE_BASE_URL: expected an http:// or https:// URL.");
+  }
+  const routing = resolveModelRouting(merged);
+  if (routing.enabled && !routing.phaseTiers.includes(routing.planningTier)) {
+    warnings.push(
+      `Disabling modelRouting: planningTier "${routing.planningTier}" is not one of phaseTiers (${routing.phaseTiers.join(", ")}).`,
+    );
+    merged.modelRouting = { ...merged.modelRouting, enabled: false };
+  }
   return { config: merged, warnings };
 }
 
@@ -361,7 +372,7 @@ export function resolveModelRouting(config: PlannotatorConfig): ModelRoutingSett
     enabled: raw.enabled ?? defaults.enabled,
     planningTier: raw.planningTier ?? defaults.planningTier,
     phaseTiers: raw.phaseTiers ?? defaults.phaseTiers,
-    systemOneUrl: raw.systemOneUrl ?? process.env.SYSTEM_ONE_BASE_URL ?? defaults.systemOneUrl,
+    systemOneUrl: raw.systemOneUrl ?? (isHttpUrl(process.env.SYSTEM_ONE_BASE_URL) ? process.env.SYSTEM_ONE_BASE_URL : defaults.systemOneUrl),
     systemOneModel: raw.systemOneModel ?? defaults.systemOneModel,
     minProbability: raw.minProbability ?? defaults.minProbability,
     timeoutMs: raw.timeoutMs ?? defaults.timeoutMs,

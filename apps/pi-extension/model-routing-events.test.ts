@@ -142,8 +142,6 @@ describe("planning tier lock", () => {
 		expect(await harness.prompt()).toBeUndefined();
 		expect(await harness.prompt()).toBeUndefined();
 		expect(harness.locks()).toEqual(["frontier", "frontier", "frontier"]);
-		expect(await harness.prompt("/plannotator-plan-mode")).toBeUndefined();
-		expect(harness.locks()).toHaveLength(3);
 	});
 
 	test("holds prompts back once Bifrost routing is turned off or the session is pinned", async () => {
@@ -196,6 +194,27 @@ describe("planning tier lock", () => {
 		expect(harness.bus.slice(released).map((event) => event.channel)).toEqual([BIFROST_RELEASE_EVENT]);
 	});
 
+	test("adopts a late grant for the still-wanted tier without requesting again", async () => {
+		globalThis.setTimeout = ((fn: () => void, delay?: number) => originalSetTimeout(fn, delay === 5_000 ? 5 : delay)) as typeof setTimeout;
+		let pending: LockPayload | undefined;
+		const harness = createHarness(workspace(), { startInPlan: true, respond: (payload) => { pending = payload; } });
+		await harness.start();
+		const settled = harness.bus.length;
+		pending!.reply({ ok: true, tier: "frontier" });
+		await flush();
+		await flush();
+		expect(harness.bus.length).toBe(settled);
+		harness.respond = acknowledge;
+		expect(await harness.prompt()).toBeUndefined();
+	});
+
+	test("checks the lock for skill and prompt-template input in planning", async () => {
+		const harness = createHarness(workspace(), { startInPlan: true, respond: (payload) => payload.reply({ ok: false, reason: "routing is off" }) });
+		await harness.start();
+		expect(await harness.prompt("/skill:research compare sandboxes")).toEqual({ action: "handled" });
+		expect(await harness.prompt("/my-template continue")).toEqual({ action: "handled" });
+	});
+
 	test("releases on session shutdown and on navigating to a branch outside plan mode", async () => {
 		const entries: unknown[] = [];
 		const harness = createHarness(workspace(), { startInPlan: true, entries });
@@ -213,6 +232,15 @@ describe("planning tier lock", () => {
 });
 
 describe("execution tier lock", () => {
+	test("persists builder line counts after tool-only turns", async () => {
+		const harness = createHarness(workspace(TWO_PHASE_PLAN), { entries: executingEntries() });
+		await harness.start();
+		await harness.fire("tool_call", { toolName: "write", input: { path: "src/a.ts", content: "one\ntwo\nthree\n" } });
+		await harness.fire("turn_end", { message: { role: "assistant", content: [{ type: "toolCall", id: "t1", name: "write", arguments: {} }] } });
+		const snapshot = harness.appended.filter((entry) => entry.type === "plannotator").at(-1)!.data.modelUsage;
+		expect(snapshot.builders["wovey/global.anthropic.claude-opus-5-5"]).toBeGreaterThan(0);
+	});
+
 	test("locks the first open phase's tier and advances it as checklist steps complete", async () => {
 		const cwd = workspace(TWO_PHASE_PLAN);
 		const harness = createHarness(cwd, { entries: executingEntries() });

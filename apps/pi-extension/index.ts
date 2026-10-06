@@ -513,9 +513,15 @@ export default function plannotator(pi: ExtensionAPI): void {
 		if (!revalidate && (wanted === lockHeld || wanted === lockRefused)) return undefined;
 		lockMaybeHeld = true;
 		const result = await requestTierLock(pi.events, wanted, {
-			onLateReply: () => {
+			onLateReply: (late) => {
+				if (!late.ok) return;
 				lockMaybeHeld = true;
-				void enqueueLockReconcile(true);
+				if (lockTarget !== wanted) {
+					void enqueueLockReconcile(true);
+					return;
+				}
+				lockHeld = wanted;
+				lockRefused = undefined;
 			},
 		});
 		if (result.ok) {
@@ -1482,7 +1488,7 @@ export default function plannotator(pi: ExtensionAPI): void {
 
 	// Planning and grilling run only on the planning tier, revalidated per prompt; execution advances the lock first.
 	pi.on("input", async (event, ctx) => {
-		if (!resolveModelRouting(plannotatorConfig).enabled || event.text.trimStart().startsWith("/")) return;
+		if (!resolveModelRouting(plannotatorConfig).enabled) return;
 		if (phase === "executing") {
 			refreshChecklistFromDisk(ctx);
 			await syncModelLock(ctx);
@@ -1699,17 +1705,16 @@ Mark completed steps with [DONE:n] in your response.`
 			persistState();
 			return;
 		}
-		if (phase !== "executing" || checklistItems.length === 0) return;
+		if (phase !== "executing") return;
 
-		const text = getAssistantMessageText(event.message);
-		if (!text) return;
-		if (markCompletedSteps(text, checklistItems) > 0) {
+		const text = checklistItems.length > 0 ? getAssistantMessageText(event.message) : "";
+		if (text && markCompletedSteps(text, checklistItems) > 0) {
 			updateStatus(ctx);
 			updateWidget(ctx);
 			await syncTodoProvider(ctx);
 			await syncModelLock(ctx);
 		}
-		persistState();
+		if (text || resolveModelRouting(plannotatorConfig).enabled) persistState();
 	});
 
 	// Detect execution completion

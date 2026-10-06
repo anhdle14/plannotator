@@ -102,6 +102,34 @@ describe("plannotator config", () => {
     ]);
   });
 
+  test("model routing is disabled when planningTier is not one of phaseTiers", () => {
+    const cwdDir = makeTempDir("plannotator-config-cwd-routing-tiers-");
+    process.env.HOME = makeTempDir("plannotator-config-home-routing-tiers-");
+    mkdirSync(join(cwdDir, ".pi"), { recursive: true });
+    writeFileSync(join(cwdDir, ".pi", "plannotator.json"), JSON.stringify({ modelRouting: { enabled: true, phaseTiers: ["small", "large"] } }), "utf-8");
+
+    const loaded = loadPlannotatorConfig(cwdDir, { projectTrusted: true });
+    expect(loaded.warnings).toEqual([expect.stringContaining('planningTier "frontier" is not one of phaseTiers (small, large)')]);
+    expect(resolveModelRouting(loaded.config).enabled).toBe(false);
+  });
+
+  test("ignores an invalid SYSTEM_ONE_BASE_URL with a warning", () => {
+    const cwdDir = makeTempDir("plannotator-config-cwd-routing-env-");
+    process.env.HOME = makeTempDir("plannotator-config-home-routing-env-");
+    const previous = process.env.SYSTEM_ONE_BASE_URL;
+    process.env.SYSTEM_ONE_BASE_URL = "localhost:8008";
+    try {
+      const loaded = loadPlannotatorConfig(cwdDir, { projectTrusted: true });
+      expect(loaded.warnings).toEqual([expect.stringContaining("Ignoring SYSTEM_ONE_BASE_URL")]);
+      expect(resolveModelRouting(loaded.config).systemOneUrl).toBe("http://127.0.0.1:8008");
+      process.env.SYSTEM_ONE_BASE_URL = "http://judge.local:9000";
+      expect(resolveModelRouting(loaded.config).systemOneUrl).toBe("http://judge.local:9000");
+    } finally {
+      if (previous === undefined) delete process.env.SYSTEM_ONE_BASE_URL;
+      else process.env.SYSTEM_ONE_BASE_URL = previous;
+    }
+  });
+
   test("loads external execution mode with project precedence", () => {
     const homeDir = makeTempDir("plannotator-config-home-execution-");
     const cwdDir = makeTempDir("plannotator-config-cwd-execution-");
