@@ -96,26 +96,16 @@ Approval never begins implementation directly. During grilling, Pi reads the app
 
 Print/JSON mode and missing browser assets fail closed. The fork never auto-approves or hands off an unreviewed plan. On resubmission, Plan Diff highlights what changed between versions.
 
-### Plan templates
+### Free-text planning
 
-Start a plan from a template with `/plannotator <type> [intent]`, for example `/plannotator bug-investigation flaky gateway test`.
-Run `/plannotator` with no arguments to list the available templates and where each one comes from.
+Switch to Pi's plan mode with Shift+Tab, then press Ctrl+G to edit the prompt in Pi's configured external editor.
+Write the request as free text and use Markdown snippets if your editor provides them.
+This extension does not configure Neovim or ship user-specific snippets.
 
-The command writes the template to `tmp/plans/<YYYY-MM-DD>-<slug>.md`, enters planning, and asks the agent to fill that file in place and submit it.
-The slug comes from the intent, or from the template name when no intent is given.
-An existing plan file is never overwritten; the command adds `-2`, `-3`, and so on instead.
-The command refuses to start a new plan while a plan is in grilling, execution, or review.
-
-Built-in templates: `research-decision`, `bug-investigation`, `implementation`, `migration-rollout`, `refactor`, and `review`.
-Templates are Markdown files resolved in this order, where a later layer overrides a file with the same name:
-
-1. Built-in templates shipped in `templates/`.
-1. User templates in `~/.pi/agent/plannotator/templates/*.md` (or `$PI_CODING_AGENT_DIR/plannotator/templates/`).
-1. Project templates in `<cwd>/.pi/plannotator/templates/*.md`, loaded only when Pi trusts the project.
-
-The file name without `.md` is the template type.
-An optional `description:` front matter line provides the listing text and is removed from the scaffolded plan.
-Templates support `{{date}}`, `{{intent}}`, and `{{owner}}` (Git `user.name`, falling back to the OS user); unknown placeholders are left as-is and reported.
+By default, the bundled planning instructions ask the planner to organize the result into Context, Approach, Files to modify, Reuse, Steps, and Verification.
+Customize `phases.planning.instructions` in `~/.pi/agent/plannotator.json` to request front matter, shared sections, type-specific details, or preservation of selected user material.
+When model routing is enabled, Plannotator can ask Pi-Bifrost to lock the configured planning tier; plan structure still comes from the configured instructions, not a schema enforced by the extension.
+The generated plan is then submitted for Plannotator's browser review and mandatory grill.
 
 ### Programmatic plan-mode control
 
@@ -275,7 +265,7 @@ It is off by default; set `planStore.root` to an absolute or `~/` path in any co
 - `<repo>` is the basename of the repository's main worktree, the first entry of `git worktree list --porcelain`, so every worktree of a repository maps to the same `<root>/<repo>/`.
 - `<root>/<repo>/main/` holds plans shared with the main checkout, and a session in the main checkout uses it as its own directory whatever branch is checked out.
 - `<root>/<repo>/<branch>/` holds plans owned by a linked worktree; a branch such as `feat/x` becomes the nested `feat/x/` directory, and a detached HEAD uses its short SHA.
-- `/plannotator <type>` scaffolds into the worktree's own directory, creating it on first use, and reports the absolute path.
+- When enabled, free-text planning writes new plans to the worktree's own directory, and the planning instructions name the shared `main/` directory.
 - The submit tool and the planning instructions default new plans to `<own dir>/<slug>.md` and name the shared `main/` directory.
 - Markdown plans are allowed inside cwd or anywhere under `<root>/<repo>/`, given as absolute, cwd-relative, or `~/` paths.
   The store root itself, other repositories' directories, `..` escapes, and non-Markdown files are rejected, and rewriting `- Model:` lines also refuses a symlink that resolves outside cwd and `<root>/<repo>/`.
@@ -368,7 +358,6 @@ During execution, the agent marks completed steps with `[DONE:n]` markers. Progr
 
 | Command | Description |
 |---------|-------------|
-| `/plannotator [<type> [intent]]` | List plan templates, or scaffold `tmp/plans/<date>-<slug>.md` from one and enter planning |
 | `/plannotator-plan-mode` | Toggle plan mode. Plans default to `tmp/plans/<slug>.md` and require browser review plus grilling |
 | `/plannotator-review` | Open code review UI for current changes |
 | `/plannotator-annotate <file>` | Open markdown file in annotation UI |

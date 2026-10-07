@@ -12,7 +12,7 @@ import {
 	resolvePlanStore,
 	submitPlanToolText,
 } from "./plan-store.ts";
-import { writePlanScaffold } from "./plan-templates.ts";
+import { writePlanScaffold } from "./plan-store.ts";
 import { isPlanWritePathAllowed } from "./tool-scope.ts";
 
 const savedEnv = {

@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { join } from "node:path";
 import plannotator from "./index.ts";
 
 type Context = ReturnType<typeof createContext>;
@@ -117,13 +117,14 @@ afterAll(() => {
 });
 
 describe("plan store in the Pi runtime", () => {
-	test("a linked worktree scaffolds, writes, and submits plans in its store dir", async () => {
+	test("a linked worktree plans through its store dir", async () => {
 		writeGlobalConfig({ planStore: { root: storeRoot } });
 		const ownDir = join(storeRoot, "myrepo", "feat", "x");
 		const sharedDir = join(storeRoot, "myrepo", "main");
 		const runtime = createRuntime();
 		const context = createContext(linkedDir);
 		await runtime.run("session_start", {}, context);
+		await runtime.commands.get("plannotator-plan-mode")?.handler("", context);
 
 		const submit = runtime.submitTool();
 		expect(runtime.registrations.filter((tool) => tool.name === "plannotator_submit_plan")).toHaveLength(2);
@@ -131,17 +132,15 @@ describe("plan store in the Pi runtime", () => {
 		expect(submit.description).toContain(sharedDir);
 		expect(submit.parameters.properties.filePath.description).toContain(join(storeRoot, "myrepo"));
 
+		expect(runtime.commands.get("plannotator")).toBeUndefined();
 		expect(existsSync(ownDir)).toBe(false);
-		await runtime.commands.get("plannotator")?.handler("implementation shared store", context);
-		const prompt = runtime.userMessages.at(-1) ?? "";
-		const scaffold = /scaffold from the built-in template is at (.+\.md)\./.exec(prompt)?.[1] ?? "";
-		expect(isAbsolute(scaffold)).toBe(true);
-		expect(scaffold.startsWith(`${ownDir}/`)).toBe(true);
-		expect(existsSync(scaffold)).toBe(true);
+		const planPath = join(ownDir, "plan.md");
+		mkdirSync(ownDir, { recursive: true });
+		writeFileSync(planPath, "# Plan\n\n- [ ] Step one\n", "utf-8");
 		expect(existsSync(join(linkedDir, "tmp"))).toBe(false);
 
 		const gate = async (path: string) => (await runtime.run("tool_call", { toolName: "write", input: { path } }, context))[0];
-		expect(await gate(scaffold)).toBeUndefined();
+		expect(await gate(planPath)).toBeUndefined();
 		expect(await gate(join(sharedDir, "shared.md"))).toBeUndefined();
 		expect(await gate("tmp/plans/local.md")).toBeUndefined();
 		expect(await gate(join(storeRoot, "otherrepo", "main", "plan.md"))).toMatchObject({
@@ -153,8 +152,7 @@ describe("plan store in the Pi runtime", () => {
 		const framing = (await runtime.run("before_agent_start", {}, context))[0] as { message: { content: string } };
 		expect(framing.message.content).toContain(`- Plan store: write new plans to ${join(ownDir, "<descriptive-kebab-case-slug>.md")}`);
 
-		writeFileSync(scaffold, "# Plan\n\n- [ ] Step one\n", "utf-8");
-		const accepted = await submit.execute("1", { filePath: scaffold }, undefined, undefined, context);
+		const accepted = await submit.execute("1", { filePath: planPath }, undefined, undefined, context);
 		expect(accepted.details).toMatchObject({ approved: false, reviewUnavailable: true });
 
 		mkdirSync(join(storeRoot, "otherrepo"), { recursive: true });
@@ -170,14 +168,17 @@ describe("plan store in the Pi runtime", () => {
 		const runtime = createRuntime();
 		const context = createContext(linkedDir);
 		await runtime.run("session_start", {}, context);
+		await runtime.commands.get("plannotator-plan-mode")?.handler("", context);
 		expect(runtime.registrations.filter((tool) => tool.name === "plannotator_submit_plan")).toHaveLength(1);
 		expect(runtime.submitTool().description).toContain("Use tmp/plans/<descriptive-kebab-case-slug>.md by default");
 
-		await runtime.commands.get("plannotator")?.handler("implementation local plan", context);
-		const scaffold = /scaffold from the built-in template is at (.+\.md)\./.exec(runtime.userMessages.at(-1) ?? "")?.[1] ?? "";
-		expect(scaffold.startsWith("tmp/plans/")).toBe(true);
-		expect(readFileSync(join(linkedDir, scaffold), "utf-8").length).toBeGreaterThan(0);
+		expect(runtime.commands.get("plannotator")).toBeUndefined();
+		const planPath = join(linkedDir, "tmp", "plans", "local.md");
+		mkdirSync(join(linkedDir, "tmp", "plans"), { recursive: true });
+		writeFileSync(planPath, "# Plan\n\n- [ ] Step one\n", "utf-8");
 
+		const allowed = (await runtime.run("tool_call", { toolName: "write", input: { path: planPath } }, context))[0];
+		expect(allowed).toBeUndefined();
 		const blocked = (await runtime.run("tool_call", { toolName: "write", input: { path: join(storeRoot, "myrepo", "main", "plan.md") } }, context))[0];
 		expect(blocked).toMatchObject({ block: true, reason: expect.stringContaining("limited to markdown files inside cwd. Blocked:") });
 		const framing = (await runtime.run("before_agent_start", {}, context))[0] as { message: { content: string } };
