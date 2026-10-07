@@ -39,6 +39,8 @@
     "tool-scope.ts",
     "grill.ts",
     "config.ts",
+    "plan-templates.ts",
+    "templates/",
     "plannotator.json",
     "server/",
     "todo-providers/",
