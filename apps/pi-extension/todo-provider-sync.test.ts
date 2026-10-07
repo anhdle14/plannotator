@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import plannotator from "./index.ts";
+import { isolateAgentDir } from "./test-setup/agent-dir.ts";
 import { hashPlanContent } from "./grill.ts";
 
 /**
@@ -29,6 +30,8 @@ function restoreEnv(name: string, value: string | undefined): void {
 	if (value === undefined) delete process.env[name];
 	else process.env[name] = value;
 }
+
+isolateAgentDir();
 
 beforeEach(() => {
 	// The extension resolves a real provider through the real env-sensitive

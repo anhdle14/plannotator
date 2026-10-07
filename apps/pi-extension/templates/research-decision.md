@@ -6,6 +6,7 @@ owner: {{owner}}
 created: {{date}}
 builder: <researcher>
 validator: <independent reviewer>
+models: plan=frontier; build=per phase (- Model: lines); review=cross-vendor
 ---
 # {{intent}}
 ## Question and context
