@@ -265,8 +265,7 @@ It is off by default; set `planStore.root` to an absolute or `~/` path in any co
 - `<repo>` is the basename of the repository's main worktree, the first entry of `git worktree list --porcelain`, so every worktree of a repository maps to the same `<root>/<repo>/`.
 - `<root>/<repo>/main/` holds plans shared with the main checkout, and a session in the main checkout uses it as its own directory whatever branch is checked out.
 - `<root>/<repo>/<branch>/` holds plans owned by a linked worktree; a branch such as `feat/x` becomes the nested `feat/x/` directory, and a detached HEAD uses its short SHA.
-- When enabled, free-text planning writes new plans to the worktree's own directory, and the planning instructions name the shared `main/` directory.
-- The submit tool and the planning instructions default new plans to `<own dir>/<slug>.md` and name the shared `main/` directory.
+- The planning instructions direct new plans to `<own dir>/<slug>.md` and name the shared `main/` directory; the submit tool defaults to the same location.
 - Markdown plans are allowed inside cwd or anywhere under `<root>/<repo>/`, given as absolute, cwd-relative, or `~/` paths.
   The store root itself, other repositories' directories, `..` escapes, and non-Markdown files are rejected, and rewriting `- Model:` lines also refuses a symlink that resolves outside cwd and `<root>/<repo>/`.
 - Plans submitted from the store are recorded with their absolute path, so `planFilePath` in the plan-approved event is absolute.

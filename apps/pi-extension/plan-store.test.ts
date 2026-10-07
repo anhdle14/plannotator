@@ -12,7 +12,6 @@ import {
 	resolvePlanStore,
 	submitPlanToolText,
 } from "./plan-store.ts";
-import { writePlanScaffold } from "./plan-store.ts";
 import { isPlanWritePathAllowed } from "./tool-scope.ts";
 
 const savedEnv = {
@@ -179,21 +178,7 @@ describe("realpath plan target with a plan store", () => {
 	});
 });
 
-describe("plan store scaffolds and prompts", () => {
-	test("scaffolds into the worktree's own dir with the store on, and tmp/plans with it off", () => {
-		const store = storeFor(linkedDir);
-		const stored = writePlanScaffold(linkedDir, "2026-10-07", "store-on", "# On\n", store.ownDir);
-		expect(stored).toBe(join(store.ownDir, "2026-10-07-store-on.md"));
-		expect(readFileSync(stored, "utf-8")).toBe("# On\n");
-		expect(writePlanScaffold(linkedDir, "2026-10-07", "store-on", "# On\n", store.ownDir)).toBe(
-			join(store.ownDir, "2026-10-07-store-on-2.md"),
-		);
-
-		const local = writePlanScaffold(linkedDir, "2026-10-07", "store-off", "# Off\n");
-		expect(local).toBe(join("tmp", "plans", "2026-10-07-store-off.md"));
-		expect(readFileSync(join(linkedDir, local), "utf-8")).toBe("# Off\n");
-	});
-
+describe("plan store prompts", () => {
 	test("keeps the default submit text unchanged without a store", () => {
 		expect(submitPlanToolText(undefined)).toEqual({
 			description:
