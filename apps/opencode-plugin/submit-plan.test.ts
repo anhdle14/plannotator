@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { homedir } from "os";
 import path from "path";
+import { getPlannotatorDataDir } from "@plannotator/shared/data-dir";
 import {
   applyEdits,
   formatWithLineNumbers,
@@ -177,7 +177,7 @@ describe("formatWithLineNumbers", () => {
 describe("getPlanBackingPath", () => {
   test("returns path inside data dir active/{project}/_active-plan.md", () => {
     const result = getPlanBackingPath("myproject");
-    const dataDir = process.env.PLANNOTATOR_DATA_DIR || path.join(homedir(), ".plannotator");
+    const dataDir = getPlannotatorDataDir();
     expect(result).toBe(path.join(dataDir, "active", "myproject", "_active-plan.md"));
   });
 
