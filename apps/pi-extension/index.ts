@@ -95,17 +95,6 @@ import { isRemoteSession, isUrlHostOverridden } from "./server/network.ts";
 import { isBrowserSessionStoppedError } from "./browser-session-error.ts";
 import { classifyAnnotateOutcome } from "./annotate-outcome.ts";
 import {
-	formatTemplateList,
-	loadPlanTemplates,
-	localDate,
-	parsePlannotatorArgs,
-	planTemplatePrompt,
-	renderPlanTemplate,
-	resolveOwner,
-	slugify,
-	writePlanScaffold,
-} from "./plan-templates.ts";
-import {
 	isInsideDir,
 	normalizePlanInputPath,
 	type PlanStore,
@@ -299,7 +288,6 @@ function sendUserMessageWithCurrentSessionFallback(
 export default function plannotator(pi: ExtensionAPI): void {
 	const currentPiSession = registerCurrentPiSession(pi);
 	let phase: Phase = "idle";
-	let templateScope = { cwd: process.cwd(), projectTrusted: false };
 	void registerPlannotatorEventListeners(pi, {
 		handlePlanMode: async (mode, ctx) => {
 			if (mode === "status") return { phase };
@@ -670,71 +658,6 @@ export default function plannotator(pi: ExtensionAPI): void {
 		persistState();
 	}
 	// ── Commands & Shortcuts ─────────────────────────────────────────────
-
-	pi.registerCommand("plannotator", {
-		description: "List plan templates, or start a plan from one: /plannotator <type> [intent]",
-		getArgumentCompletions: (prefix) => {
-			if (/\s/.test(prefix)) return null;
-			const items = loadPlanTemplates(templateScope.cwd, templateScope)
-				.templates.filter((template) => template.name.startsWith(prefix))
-				.map((template) => ({
-					value: template.name,
-					label: template.name,
-					description: template.description ?? `${template.source} template`,
-				}));
-			return items.length > 0 ? items : null;
-		},
-		handler: async (args, ctx) => {
-			const trustFn = ctx.isProjectTrusted as (() => boolean) | undefined;
-			templateScope = { cwd: ctx.cwd, projectTrusted: typeof trustFn === "function" ? trustFn.call(ctx) : false };
-			const { templates, warnings } = loadPlanTemplates(ctx.cwd, templateScope);
-			for (const warning of warnings) ctx.ui.notify(`Plannotator templates: ${warning}`, "warning");
-			const { type, intent } = parsePlannotatorArgs(args);
-			if (!type) {
-				ctx.ui.notify(formatTemplateList(templates), "info");
-				return;
-			}
-			const template = templates.find((candidate) => candidate.name === type);
-			if (!template) {
-				const names = templates.map((candidate) => candidate.name).join(", ") || "none";
-				ctx.ui.notify(`Unknown plan template "${type}". Valid types: ${names}`, "error");
-				return;
-			}
-			if (phase !== "idle" && phase !== "planning") {
-				ctx.ui.notify(
-					`Plannotator is in the ${phase} phase. Finish it or exit with /plannotator-plan-mode before starting a new plan.`,
-					"error",
-				);
-				return;
-			}
-			const date = localDate();
-			const { text, unknownPlaceholders } = renderPlanTemplate(template.content, {
-				date,
-				intent: intent || "<intent>",
-				owner: resolveOwner(ctx.cwd),
-			});
-			if (unknownPlaceholders.length > 0) {
-				ctx.ui.notify(
-					`Template ${template.name} has unknown placeholders left as-is: ${unknownPlaceholders.map((key) => `{{${key}}}`).join(", ")}`,
-					"warning",
-				);
-			}
-			planStore = resolvePlanStore(ctx.cwd, plannotatorConfig);
-			const planPath = writePlanScaffold(
-				ctx.cwd,
-				date,
-				slugify(intent) || slugify(template.name),
-				text,
-				planStore?.ownDir,
-			);
-			if (phase === "idle") await enterPlanning(ctx);
-			ctx.ui.notify(`Plannotator: ${template.name} plan scaffolded at ${planPath}.`);
-			pi.sendUserMessage(
-				planTemplatePrompt({ template, planPath, intent }),
-				ctx.isIdle() ? undefined : { deliverAs: "followUp" },
-			);
-		},
-	});
 
 	pi.registerCommand("plannotator-plan-mode", {
 		description: "Toggle plannotator planning mode",
@@ -1900,7 +1823,6 @@ Mark completed steps with [DONE:n] in your response.`
 	pi.on("session_start", async (_event, ctx) => {
 		const trustFn = ctx.isProjectTrusted as (() => boolean) | undefined;
 		const projectTrusted = typeof trustFn === "function" ? trustFn.call(ctx) : false;
-		templateScope = { cwd: ctx.cwd, projectTrusted };
 		if (typeof trustFn !== "function") {
 			ctx.ui.notify(
 				"Plannotator requires Pi 0.79.1 or newer. Update Pi; project-local config is disabled on this host.",
