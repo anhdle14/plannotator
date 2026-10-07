@@ -21,21 +21,18 @@ import { join } from "path";
 import { readFileSync, statSync } from "fs";
 import { getPlannotatorDataDir } from "./data-dir";
 
-const DATA_DIR = getPlannotatorDataDir();
-
 /** Hooks subdirectory (preferred location) */
-const HOOKS_BASE_DIR = join(DATA_DIR, "hooks");
-
-/** Fallback: hooks placed directly in the data dir (pre-hooks-subdir layout) */
-const LEGACY_BASE_DIR = DATA_DIR;
+function hooksBaseDir(): string {
+  return join(getPlannotatorDataDir(), "hooks");
+}
 
 /** Maximum file size to read (50 KB) */
 const MAX_FILE_SIZE = 50 * 1024;
 
 /**
  * Known improvement hook file paths, keyed by hook name.
- * `path` is relative to HOOKS_BASE_DIR (~/.plannotator/hooks/).
- * `legacyPath` is relative to LEGACY_BASE_DIR (~/.plannotator/).
+ * `path` is relative to the hooks subdirectory (~/.plannotator/hooks/).
+ * `legacyPath` is relative to the data dir itself (~/.plannotator/), the pre-hooks-subdir layout.
  */
 const KNOWN_HOOKS = {
   "enterplanmode-improve": {
@@ -51,7 +48,7 @@ export function getImprovementHookExpectedPath(
 ): string | null {
   const entry = KNOWN_HOOKS[hookName];
   if (!entry) return null;
-  return join(HOOKS_BASE_DIR, entry.path);
+  return join(hooksBaseDir(), entry.path);
 }
 
 export interface ImprovementHookResult {
@@ -92,9 +89,9 @@ function tryReadHookFile(
  * Read an improvement hook file by name.
  *
  * Lookup order:
- * 1. New path (HOOKS_BASE_DIR + path). If it exists and validates, return it.
+ * 1. New path (hooks subdirectory + path). If it exists and validates, return it.
  * 2. If the new path exists but is invalid (empty, oversized, etc.), return null.
- * 3. Only if the new path does not exist, try the legacy path (LEGACY_BASE_DIR + legacyPath).
+ * 3. Only if the new path does not exist, try the legacy path (data dir + legacyPath).
  */
 export function readImprovementHook(
   hookName: ImprovementHookName,
@@ -102,7 +99,7 @@ export function readImprovementHook(
   const entry = KNOWN_HOOKS[hookName];
   if (!entry) return null;
 
-  const newPath = join(HOOKS_BASE_DIR, entry.path);
+  const newPath = join(hooksBaseDir(), entry.path);
 
   // New path exists — use it exclusively (even if invalid)
   if (fileExists(newPath)) {
@@ -110,6 +107,6 @@ export function readImprovementHook(
   }
 
   // New path absent — fall back to legacy path
-  const legacyFilePath = join(LEGACY_BASE_DIR, entry.legacyPath);
+  const legacyFilePath = join(getPlannotatorDataDir(), entry.legacyPath);
   return tryReadHookFile(legacyFilePath, hookName);
 }
