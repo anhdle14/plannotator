@@ -1,4 +1,5 @@
 import { extname, isAbsolute, relative, resolve } from "node:path";
+import { isInsideDir } from "./plan-store.ts";
 
 export type Phase = "idle" | "planning" | "grilling" | "executing";
 
@@ -24,13 +25,14 @@ export function getFileMutationPath(
 }
 
 // Used by both the planning-phase write gate and plannotator_submit_plan.
-// Path must resolve inside cwd (no traversal, no absolute escape) and end
-// in a permitted markdown extension.
-export function isPlanWritePathAllowed(inputPath: string, cwd: string): boolean {
+// Path must resolve inside cwd or one of storeRoots (no traversal, no
+// absolute escape) and end in a permitted markdown extension.
+export function isPlanWritePathAllowed(inputPath: string, cwd: string, storeRoots: readonly string[] = []): boolean {
 	if (!inputPath) return false;
 	const targetAbs = resolve(cwd, inputPath);
 	const rel = relative(resolve(cwd), targetAbs);
-	if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return false;
+	const insideCwd = !(rel === "" || rel.startsWith("..") || isAbsolute(rel));
+	if (!insideCwd && !storeRoots.some((root) => isInsideDir(root, targetAbs))) return false;
 	const ext = extname(targetAbs).toLowerCase();
 	return ALLOWED_PLAN_EXTENSIONS.has(ext);
 }

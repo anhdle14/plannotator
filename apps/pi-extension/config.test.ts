@@ -113,6 +113,53 @@ describe("plannotator config", () => {
     expect(resolveModelRouting(loaded.config).enabled).toBe(false);
   });
 
+  test("plan store is off by default and merges global and project roots", () => {
+    const homeDir = makeTempDir("plannotator-config-home-store-");
+    const cwdDir = makeTempDir("plannotator-config-cwd-store-");
+    process.env.HOME = homeDir;
+    expect(loadPlannotatorConfig(cwdDir, { projectTrusted: true }).config.planStore).toBeUndefined();
+
+    mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+    mkdirSync(join(cwdDir, ".pi"), { recursive: true });
+    writeFileSync(join(homeDir, ".pi", "agent", "plannotator.json"), JSON.stringify({ planStore: { root: "~/.local/xpi" } }), "utf-8");
+    let loaded = loadPlannotatorConfig(cwdDir, { projectTrusted: true });
+    expect(loaded.warnings).toEqual([]);
+    expect(loaded.config.planStore).toEqual({ root: "~/.local/xpi" });
+
+    writeFileSync(join(cwdDir, ".pi", "plannotator.json"), JSON.stringify({ planStore: { root: "/srv/plans" } }), "utf-8");
+    expect(loadPlannotatorConfig(cwdDir, { projectTrusted: true }).config.planStore).toEqual({ root: "/srv/plans" });
+    expect(loadPlannotatorConfig(cwdDir, { projectTrusted: false }).config.planStore).toEqual({ root: "~/.local/xpi" });
+
+    writeFileSync(join(cwdDir, ".pi", "plannotator.json"), JSON.stringify({ planStore: null }), "utf-8");
+    loaded = loadPlannotatorConfig(cwdDir, { projectTrusted: true });
+    expect(loaded.warnings).toEqual([]);
+    expect(loaded.config.planStore).toBeNull();
+  });
+
+  test("plan store rejects invalid shapes with field-specific warnings", () => {
+    const cwdDir = makeTempDir("plannotator-config-cwd-store-invalid-");
+    process.env.HOME = makeTempDir("plannotator-config-home-store-invalid-");
+    mkdirSync(join(cwdDir, ".pi"), { recursive: true });
+    const load = (planStore: unknown) => {
+      writeFileSync(join(cwdDir, ".pi", "plannotator.json"), JSON.stringify({ planStore }), "utf-8");
+      return loadPlannotatorConfig(cwdDir, { projectTrusted: true });
+    };
+
+    for (const value of ["~/.local/xpi", 3, ["/srv"]]) {
+      const loaded = load(value);
+      expect(loaded.warnings).toEqual([expect.stringMatching(/^Ignoring planStore in .*: expected an object\.$/)]);
+      expect(loaded.config.planStore).toBeUndefined();
+    }
+    for (const root of ["", "   ", 7, "relative/plans"]) {
+      const loaded = load({ root });
+      expect(loaded.warnings).toEqual([expect.stringMatching(/^Ignoring planStore\.root in .*: expected a non-empty absolute or ~\/ path\.$/)]);
+      expect(loaded.config.planStore).toEqual({});
+    }
+    const unknown = load({ root: "/srv/plans", dir: "x", mode: 1 });
+    expect(unknown.warnings).toEqual([expect.stringMatching(/^Ignoring unknown planStore keys in .*: dir, mode\.$/)]);
+    expect(unknown.config.planStore).toEqual({ root: "/srv/plans" });
+  });
+
   test("ignores an invalid SYSTEM_ONE_BASE_URL with a warning", () => {
     const cwdDir = makeTempDir("plannotator-config-cwd-routing-env-");
     process.env.HOME = makeTempDir("plannotator-config-home-routing-env-");

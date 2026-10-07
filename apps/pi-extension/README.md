@@ -261,6 +261,28 @@ Routing is off by default; enable it with `modelRouting` in any config layer:
 - `planningTier` must be one of `phaseTiers`; otherwise Plannotator warns and turns routing off.
 - `systemOneUrl` falls back to `SYSTEM_ONE_BASE_URL` when that is an http(s) URL, then loopback port 8008.
 
+### Plan store
+
+A plan store keeps plans outside every git worktree, so agents in separate worktrees of one repository share plan files without copying them.
+It is off by default; set `planStore.root` to an absolute or `~/` path in any config layer, or set `planStore` to `null` to clear an inherited store:
+
+```json
+{
+  "planStore": { "root": "~/.local/xpi" }
+}
+```
+
+- `<repo>` is the basename of the repository's main worktree, the first entry of `git worktree list --porcelain`, so every worktree of a repository maps to the same `<root>/<repo>/`.
+- `<root>/<repo>/main/` holds plans shared with the main checkout, and a session in the main checkout uses it as its own directory whatever branch is checked out.
+- `<root>/<repo>/<branch>/` holds plans owned by a linked worktree; a branch such as `feat/x` becomes the nested `feat/x/` directory, and a detached HEAD uses its short SHA.
+- `/plannotator <type>` scaffolds into the worktree's own directory, creating it on first use, and reports the absolute path.
+- The submit tool and the planning instructions default new plans to `<own dir>/<slug>.md` and name the shared `main/` directory.
+- Markdown plans are allowed inside cwd or anywhere under `<root>/<repo>/`, given as absolute, cwd-relative, or `~/` paths.
+  The store root itself, other repositories' directories, `..` escapes, and non-Markdown files are rejected, and rewriting `- Model:` lines also refuses a symlink that resolves outside cwd and `<root>/<repo>/`.
+- Plans submitted from the store are recorded with their absolute path, so `planFilePath` in the plan-approved event is absolute.
+- Without `planStore`, or outside a git repository, plans stay inside cwd exactly as described above.
+- An invalid `planStore` value, a `root` that is not an absolute or `~/` path, and unknown keys are ignored with a warning that names them.
+
 ### Code review
 
 Run `/plannotator-review` to open your current VCS changes in the code review UI. Annotate specific lines, switch between the modes supported by the detected Git, GitButler, or JJ provider, and submit feedback that gets sent to the agent. Pass `--git` or `--gitbutler` to force that provider; GitButler requires `but` 0.21.0 or newer on `PATH`.

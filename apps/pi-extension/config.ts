@@ -1,8 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { DEFAULT_MODEL_ROUTING, type ModelRoutingSettings, TIER_NAME } from "./model-routing.ts";
+import type { PlanStoreConfig } from "./plan-store.ts";
 
 export type PhaseName = "planning" | "grilling" | "executing" | "reviewing";
 export type RuntimePhase = PhaseName | "idle";
@@ -41,6 +42,8 @@ export interface PlannotatorConfig {
   defaults?: PhaseProfile | null;
   phases?: Partial<Record<PhaseName, PhaseProfile | null>>;
   modelRouting?: ModelRoutingConfig;
+  /** Per-repo plan store shared across worktrees; absent or null keeps plans in cwd. */
+  planStore?: PlanStoreConfig | null;
 }
 
 export interface LoadedPlannotatorConfig {
@@ -150,7 +153,15 @@ function mergeConfig(base: PlannotatorConfig, override: PlannotatorConfig): Plan
     defaults: mergeProfile(base.defaults, override.defaults),
     phases: Object.keys(phases).length > 0 ? phases : undefined,
     modelRouting: mergeModelRouting(base.modelRouting, override.modelRouting),
+    planStore: mergePlanStore(base.planStore, override.planStore),
   };
+}
+
+function mergePlanStore(base: PlanStoreConfig | null | undefined, override: PlanStoreConfig | null | undefined): PlanStoreConfig | null | undefined {
+  if (override === null) return null;
+  if (!override) return base;
+  if (!base) return override;
+  return { ...base, ...override };
 }
 
 function mergeModelRouting(base: ModelRoutingConfig | undefined, override: ModelRoutingConfig | undefined): ModelRoutingConfig | undefined {
@@ -235,6 +246,24 @@ function normalizeModelRouting(raw: unknown, path: string, warnings: string[]): 
   return config;
 }
 
+function normalizePlanStore(raw: unknown, path: string, warnings: string[]): PlanStoreConfig | null | undefined {
+  if (raw === undefined || raw === null) return raw;
+  if (!isRecord(raw)) {
+    warnings.push(`Ignoring planStore in ${path}: expected an object.`);
+    return undefined;
+  }
+  const config: PlanStoreConfig = {};
+  if (raw.root !== undefined) {
+    const root = typeof raw.root === "string" ? raw.root.trim() : "";
+    // A relative root would resolve per worktree, defeating a store shared across worktrees.
+    if (root && (isAbsolute(root) || root === "~" || root.startsWith("~/"))) config.root = root;
+    else warnings.push(`Ignoring planStore.root in ${path}: expected a non-empty absolute or ~/ path.`);
+  }
+  const unknown = Object.keys(raw).filter((key) => key !== "root");
+  if (unknown.length > 0) warnings.push(`Ignoring unknown planStore keys in ${path}: ${unknown.join(", ")}.`);
+  return config;
+}
+
 function isHttpUrl(value: unknown): value is string {
   if (typeof value !== "string") return false;
   try {
@@ -268,6 +297,8 @@ function loadConfigSource(path: string): { config: PlannotatorConfig; warnings: 
   if ("defaults" in raw) config.defaults = normalizeProfile(raw.defaults);
   const modelRouting = normalizeModelRouting(raw.modelRouting, path, warnings);
   if (modelRouting) config.modelRouting = modelRouting;
+  const planStore = normalizePlanStore(raw.planStore, path, warnings);
+  if (planStore !== undefined) config.planStore = planStore;
 
   if ("phases" in raw && isRecord(raw.phases)) {
     const phases: Partial<Record<PhaseName, PhaseProfile | null>> = {};

@@ -1,7 +1,8 @@
 /**
  * Plannotator Pi Extension — File-based plan mode with visual browser review.
  *
- * During planning the agent writes any markdown file anywhere inside cwd and
+ * During planning the agent writes any markdown file anywhere inside cwd (or
+ * the configured per-repo plan store) and
  * calls plannotator_submit_plan with the path. The user reviews in the
  * browser UI and can approve, deny with annotations, or request changes.
  *
@@ -9,7 +10,7 @@
  * - /plannotator-plan-mode command or Ctrl+Alt+P to toggle
  * - --plan flag to start in planning mode
  * - Bash unrestricted during planning (prompt-guided)
- * - Writes restricted to markdown files inside cwd during planning
+ * - Writes restricted to markdown files inside cwd or the plan store during planning
  * - plannotator_submit_plan tool with browser-based visual approval
  * - [DONE:n] markers for execution progress tracking
  * - /plannotator-review command for code review
@@ -22,6 +23,7 @@ import { Type } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
+	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Key } from "@earendil-works/pi-tui";
 import { buildPromptVariables, formatTodoList, loadPlannotatorConfig, renderTemplate, resolveExecutionMode, resolveModelRouting, resolvePhaseProfile } from "./config.ts";
@@ -103,6 +105,15 @@ import {
 	slugify,
 	writePlanScaffold,
 } from "./plan-templates.ts";
+import {
+	isInsideDir,
+	normalizePlanInputPath,
+	type PlanStore,
+	planStoreRoots,
+	planStoreRule,
+	resolvePlanStore,
+	submitPlanToolText,
+} from "./plan-store.ts";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -310,6 +321,8 @@ export default function plannotator(pi: ExtensionAPI): void {
 	let grillSummary: string | undefined;
 	let checklistItems: ChecklistItem[] = [];
 	let plannotatorConfig = {};
+	/** Per-repo plan store for this session's cwd; undefined keeps plans inside cwd only. */
+	let planStore: PlanStore | undefined;
 	let justEnteredGrill = false;
 	// One-shot latch per phase entry: the phase framing message is delivered on
 	// the first prompt of a phase and then lives in conversation history, so it
@@ -432,8 +445,10 @@ export default function plannotator(pi: ExtensionAPI): void {
 			}
 		}
 		// Tag on the cwd-relative path: it is stable across machines and reads
-		// cleanly in the /todos detail view, which renders raw tags.
-		const planId = relative(ctx.cwd, resolve(ctx.cwd, lastSubmittedPath)) || lastSubmittedPath;
+		// cleanly in the /todos detail view, which renders raw tags. Plan-store
+		// plans live outside cwd, so they keep their absolute path.
+		const planAbs = resolve(ctx.cwd, lastSubmittedPath);
+		const planId = isInsideDir(ctx.cwd, planAbs) ? relative(ctx.cwd, planAbs) : planAbs;
 		try {
 			await todoProvider.sync(checklistItems, planId);
 		} catch (error) {
@@ -704,7 +719,14 @@ export default function plannotator(pi: ExtensionAPI): void {
 					"warning",
 				);
 			}
-			const planPath = writePlanScaffold(ctx.cwd, date, slugify(intent) || slugify(template.name), text);
+			planStore = resolvePlanStore(ctx.cwd, plannotatorConfig);
+			const planPath = writePlanScaffold(
+				ctx.cwd,
+				date,
+				slugify(intent) || slugify(template.name),
+				text,
+				planStore?.ownDir,
+			);
 			if (phase === "idle") await enterPlanning(ctx);
 			ctx.ui.notify(`Plannotator: ${template.name} plan scaffolded at ${planPath}.`);
 			pi.sendUserMessage(
@@ -1143,20 +1165,20 @@ export default function plannotator(pi: ExtensionAPI): void {
 
 	// ── plannotator_submit_plan Tool ────────────────────────────────────
 
-	pi.registerTool({
+	function submitPlanToolFields(store: PlanStore | undefined): Pick<ToolDefinition<any>, "description" | "parameters"> {
+		const text = submitPlanToolText(store);
+		return {
+			description: text.description,
+			parameters: Type.Object({
+				filePath: Type.String({ description: text.filePathDescription }),
+			}) as any,
+		};
+	}
+
+	const submitPlanTool: ToolDefinition<any> = {
 		name: PLAN_SUBMIT_TOOL,
 		label: "Submit Plan",
-		description:
-			"Submit a markdown plan for mandatory browser review. " +
-			"Use tmp/plans/<descriptive-kebab-case-slug>.md by default unless applicable AGENTS or the user specifies another markdown path inside cwd. " +
-			"Approval begins a human docs/code grill; it never starts implementation directly. " +
-			"If denied or changed during grilling, edit the same file and submit it again.",
-		parameters: Type.Object({
-			filePath: Type.String({
-				description:
-					"Path to the markdown plan file, relative to the working directory. Must end in .md or .mdx and resolve inside cwd.",
-			}),
-		}) as any,
+		...submitPlanToolFields(undefined),
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			// Revised plans may be resubmitted directly from the grilling phase.
@@ -1172,25 +1194,27 @@ export default function plannotator(pi: ExtensionAPI): void {
 				};
 			}
 
-			const inputPath = (params as { filePath?: string })?.filePath?.trim();
-			if (!inputPath) {
+			const rawPath = (params as { filePath?: string })?.filePath?.trim();
+			if (!rawPath) {
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Error: ${PLAN_SUBMIT_TOOL} requires a filePath argument (default: "tmp/plans/<slug>.md").`,
+							text: `Error: ${PLAN_SUBMIT_TOOL} requires a filePath argument (default: "${submitPlanToolText(planStore).defaultPath}").`,
 						},
 					],
 					details: { approved: false },
 				};
 			}
+			const inputPath = normalizePlanInputPath(rawPath, planStore);
+			const storeRoots = planStoreRoots(planStore);
 
-			if (!isPlanWritePathAllowed(inputPath, ctx.cwd)) {
+			if (!isPlanWritePathAllowed(inputPath, ctx.cwd, storeRoots)) {
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Error: plan file must be a markdown file (.md or .mdx) inside the working directory. Rejected: ${inputPath}`,
+							text: `Error: plan file must be a markdown file (.md or .mdx) inside the working directory${planStore ? ` or the plan store ${planStore.repoDir}` : ""}. Rejected: ${rawPath}`,
 						},
 					],
 					details: { approved: false },
@@ -1250,7 +1274,7 @@ export default function plannotator(pi: ExtensionAPI): void {
 				};
 			}
 
-			const routed = await routePlanPhases(ctx, fullPath, planContent, signal);
+			const routed = await routePlanPhases(ctx, fullPath, planContent, signal, storeRoots);
 			if (!routed.ok) {
 				return {
 					content: [{ type: "text", text: `Error: ${routed.error}. The plan was not submitted for review.` }],
@@ -1335,7 +1359,7 @@ export default function plannotator(pi: ExtensionAPI): void {
 						type: "text",
 						text: getPlanDeniedPrompt("pi", loadConfig(), {
 							toolName: getPlanToolName("pi"),
-							planFileRule: buildPlanFileRule(getPlanToolName("pi"), inputPath),
+							planFileRule: buildPlanFileRule(getPlanToolName("pi"), inputPath) + planStoreRule(planStore),
 							feedback: feedbackText,
 						}),
 					},
@@ -1343,7 +1367,8 @@ export default function plannotator(pi: ExtensionAPI): void {
 				details: { approved: false, feedback: feedbackText },
 			};
 		},
-	});
+	};
+	pi.registerTool(submitPlanTool);
 
 	/** Write a System One tier into every phase without a decided `- Model:` line, before review shows the plan. */
 	async function routePlanPhases(
@@ -1351,6 +1376,7 @@ export default function plannotator(pi: ExtensionAPI): void {
 		fullPath: string,
 		planContent: string,
 		signal: AbortSignal | undefined,
+		storeRoots: readonly string[],
 	): Promise<{ ok: true; content: string } | { ok: false; error: string }> {
 		const settings = resolveModelRouting(plannotatorConfig);
 		if (!settings.enabled) return { ok: true, content: planContent };
@@ -1359,7 +1385,7 @@ export default function plannotator(pi: ExtensionAPI): void {
 			.map((planPhase, index) => ({ planPhase, index }))
 			.filter(({ planPhase }) => !planPhase.assignedTier && !planPhase.undecided);
 		if (targets.length === 0) return { ok: true, content: planContent };
-		const location = resolvePlanTarget(ctx.cwd, fullPath);
+		const location = resolvePlanTarget(ctx.cwd, fullPath, storeRoots);
 		if ("error" in location) return { ok: false, error: `cannot write phase tiers into the plan: ${location.error}` };
 		let judgments: Awaited<ReturnType<typeof classifyPhases>>;
 		try {
@@ -1384,7 +1410,7 @@ export default function plannotator(pi: ExtensionAPI): void {
 			else summary.push(`${planPhase.title}: ${judgment.kind === "assigned" ? judgment.tier : `undecided (${judgment.tier}?)`} p=${judgment.probability.toFixed(2)}`);
 		});
 		const updated = applyModelLines(planContent, phases, lines);
-		const writeError = writePlanIfUnchanged(ctx.cwd, fullPath, planContent, updated);
+		const writeError = writePlanIfUnchanged(ctx.cwd, fullPath, planContent, updated, storeRoots);
 		if (writeError) return { ok: false, error: `cannot write phase tiers into the plan: ${writeError}` };
 		if (unavailable) {
 			ctx.ui.notify(`Plannotator: ${unavailable}. Phases without a judgment were set to ${settings.planningTier}.`, "warning");
@@ -1510,12 +1536,13 @@ export default function plannotator(pi: ExtensionAPI): void {
 			return;
 		}
 		if (!isPreImplementationPhase(phase)) return;
-		const inputPath = getFileMutationPath(event.toolName, event.input);
-		if (!inputPath || isPlanWritePathAllowed(inputPath, ctx.cwd)) return;
+		const rawPath = getFileMutationPath(event.toolName, event.input);
+		const inputPath = rawPath === undefined ? undefined : normalizePlanInputPath(rawPath, planStore);
+		if (!inputPath || isPlanWritePathAllowed(inputPath, ctx.cwd, planStoreRoots(planStore))) return;
 
 		return {
 			block: true,
-			reason: `Plannotator: during ${phase}, ${event.toolName} is limited to markdown files inside cwd. Blocked: ${inputPath}`,
+			reason: `Plannotator: during ${phase}, ${event.toolName} is limited to markdown files inside cwd${planStore ? ` or ${planStore.repoDir}` : ""}. Blocked: ${rawPath}`,
 		};
 	});
 
@@ -1625,6 +1652,7 @@ Mark completed steps with [DONE:n] in your response.`
 				improvementHookContent: hook?.content ?? null,
 			});
 			if (improveContext) content += "\n\n---\n\n" + improveContext;
+			if (planStore) content += `\n\n${planStoreRule(planStore).trimEnd()}`;
 		}
 		// Instructions render an entry-time todo snapshot when they reference
 		// ${todoList}; otherwise append the snapshot so the first executing
@@ -1886,6 +1914,8 @@ Mark completed steps with [DONE:n] in your response.`
 		for (const warning of loadedConfig.warnings) {
 			ctx.ui.notify(`Plannotator config: ${warning}`, "warning");
 		}
+		planStore = resolvePlanStore(ctx.cwd, plannotatorConfig);
+		if (planStore) pi.registerTool({ ...submitPlanTool, ...submitPlanToolFields(planStore) });
 
 		// Check --plan flag
 		if (pi.getFlag("plan") === true) {
