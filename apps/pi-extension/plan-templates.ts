@@ -143,14 +143,16 @@ export function resolveOwner(cwd: string): string {
 	return userInfo().username;
 }
 
-export function writePlanScaffold(cwd: string, date: string, slug: string, text: string): string {
-	const dir = join(cwd, "tmp", "plans");
-	mkdirSync(dir, { recursive: true });
+/** Write a new scaffold under `<cwd>/tmp/plans` (returning the cwd-relative path), or under `dir` (returning the absolute path). */
+export function writePlanScaffold(cwd: string, date: string, slug: string, text: string, dir?: string): string {
+	const targetDir = dir ?? join(cwd, "tmp", "plans");
+	mkdirSync(targetDir, { recursive: true });
 	for (let attempt = 1; ; attempt += 1) {
-		const relativePath = join("tmp", "plans", `${date}-${slug}${attempt === 1 ? "" : `-${attempt}`}.md`);
+		const name = `${date}-${slug}${attempt === 1 ? "" : `-${attempt}`}.md`;
+		const planPath = dir ? join(dir, name) : join("tmp", "plans", name);
 		try {
-			writeFileSync(join(cwd, relativePath), text, { encoding: "utf-8", flag: "wx" });
-			return relativePath;
+			writeFileSync(dir ? planPath : join(cwd, planPath), text, { encoding: "utf-8", flag: "wx" });
+			return planPath;
 		} catch (err) {
 			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
 		}

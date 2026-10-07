@@ -287,13 +287,25 @@ export function applyModelLines(markdown: string, phases: readonly PlanPhase[], 
 	return out.join("\n");
 }
 
-/** Resolve a plan's real path and require it inside cwd, so writes never follow a symlink out of the project. */
-export function resolvePlanTarget(cwd: string, path: string): { target: string } | { error: string } {
+/**
+ * Resolve a plan's real path and require it inside cwd or a real store root, so writes never follow a symlink out
+ * of the project or the plan store.
+ */
+export function resolvePlanTarget(cwd: string, path: string, storeRoots: readonly string[] = []): { target: string } | { error: string } {
 	try {
 		const target = realpathSync(path);
-		const rel = relative(realpathSync(cwd), target);
-		if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-			return { error: `${path} resolves outside the working directory` };
+		const roots = [realpathSync(cwd)];
+		for (const root of storeRoots) {
+			try {
+				roots.push(realpathSync(root));
+			} catch {}
+		}
+		const inside = roots.some((root) => {
+			const rel = relative(root, target);
+			return !(rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel));
+		});
+		if (!inside) {
+			return { error: `${path} resolves outside the working directory${storeRoots.length > 0 ? " and the plan store" : ""}` };
 		}
 		return { target };
 	} catch (error) {
@@ -305,8 +317,14 @@ export function resolvePlanTarget(cwd: string, path: string): { target: string }
  * Replace the plan only if it still holds `expected`, through a same-directory temp file and rename.
  * Rename replaces a swapped-in final-component symlink instead of following it. Returns an error message.
  */
-export function writePlanIfUnchanged(cwd: string, path: string, expected: string, updated: string): string | undefined {
-	const resolved = resolvePlanTarget(cwd, path);
+export function writePlanIfUnchanged(
+	cwd: string,
+	path: string,
+	expected: string,
+	updated: string,
+	storeRoots: readonly string[] = [],
+): string | undefined {
+	const resolved = resolvePlanTarget(cwd, path, storeRoots);
 	if ("error" in resolved) return resolved.error;
 	const { target } = resolved;
 	const temp = join(dirname(target), `.${basename(target)}.${process.pid}.${Date.now()}.tmp`);
